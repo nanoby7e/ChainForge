@@ -22,13 +22,20 @@ for _sub in ('core', 'analysis', 'ui'):
 sys.path.insert(0, _here)
 
 def main():
-    # Default to TUI if no subcommand given, or if first arg looks like a flag
     args = sys.argv[1:]
-    if not args or args[0] in ("-h", "--help"):
+
+    # No args — launch TUI with empty args (will auto-load from gadgets/)
+    if not args:
+        from ui.tui import launch_tui
+        launch_tui([])
+        return
+
+    # Explicit help
+    if args[0] in ("-h", "--help"):
         print(__doc__)
         sys.exit(0)
 
-    # If first arg is a flag (starts with -) or not a known subcommand, launch TUI
+    # If first arg is a flag or not a known subcommand, pass everything to TUI
     known_cmds = {"tui", "search", "nullcheck", "suggest", "chain"}
     if args[0].startswith("-") or args[0].lower() not in known_cmds:
         from ui.tui import launch_tui

@@ -2067,11 +2067,47 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
             if confirm in (ord('y'), ord('Y')):
                 break
             elif confirm in (ord('s'), ord('S')) and has_chain:
-                # Save chain then quit
+                # Save chain then quit — show a bordered filename prompt
                 popup.clear()
                 popup.refresh()
-                path = read_line(stdscr, h // 2, max(0, (w - 40) // 2),
-                                 "Save to JSON: ")
+
+                save_lines = [
+                    "",
+                    "  Save Chain to JSON",
+                    "",
+                    "  Enter filename below.",
+                    "  Esc to cancel.",
+                    "",
+                ]
+                sp_w = 44
+                sp_h = len(save_lines) + 4
+                sp_y = max(0, (h - sp_h) // 2)
+                sp_x = max(0, (w - sp_w) // 2)
+                try:
+                    save_popup = stdscr.subwin(sp_h, sp_w, sp_y, sp_x)
+                except curses.error:
+                    save_popup = None
+
+                if save_popup:
+                    save_popup.clear()
+                    save_popup.box()
+                    safe_addstr(save_popup, 0, 2, " Save Chain ", curses.color_pair(C_TITLE))
+                    for i, line in enumerate(save_lines):
+                        stripped = line.strip()
+                        if "Save Chain to JSON" in stripped:
+                            attr = curses.color_pair(C_CYAN) | curses.A_BOLD
+                        else:
+                            attr = curses.color_pair(C_DIM)
+                        safe_addstr(save_popup, i + 1, 1, line[:sp_w - 2], attr)
+                    save_popup.refresh()
+
+                path = read_line(stdscr, sp_y + sp_h - 2,
+                                 sp_x + 2, "File: ")
+
+                if save_popup:
+                    save_popup.clear()
+                    save_popup.refresh()
+
                 if path and path.strip():
                     try:
                         with open(path.strip(), "w") as f:
@@ -2082,7 +2118,7 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
                         state.status_msg = f"Save failed: {e}"
                         state.dirty = True
                         continue
-                # Empty path — cancelled, go back
+                # Empty path or Esc — cancelled, go back
             state.dirty = True
             continue
         elif key == ord('?'):
