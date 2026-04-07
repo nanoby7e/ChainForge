@@ -18,11 +18,16 @@ This tool is intended for authorized security research, penetration testing, and
 # Generate gadgets from a DLL using rp++
 rp-win-x86.exe -f target.dll -r 5 > target_rop.txt
 
-# Launch the TUI
-python chainforge.py tui -f target_rop.txt
+# Launch the TUI (default — no subcommand needed)
+python chainforge.py -f target_rop.txt
+python chainforge.py -f target_rop.txt -f ntdll_rop.txt
+python chainforge.py -f target_rop.txt -b 00,0a,0d,09,20
 
-# Multiple files and custom bad chars
-python chainforge.py tui -f target_rop.txt -f ntdll_rop.txt -b 00,0a,0d,09,20
+# CLI subcommands
+python chainforge.py search -f target_rop.txt "mov eax"
+python chainforge.py nullcheck 0x10021c89
+python chainforge.py suggest "copy eax to ebx"
+python chainforge.py chain
 ```
 
 Press `?` inside the TUI to open the help menu.

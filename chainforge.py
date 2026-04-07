@@ -4,7 +4,8 @@ ChainForge — Windows ROP chain development toolkit
 Pure stdlib. No dependencies. Python 3.6+
 
 Usage:
-    python chainforge.py tui                          # interactive TUI
+    python chainforge.py -f rop.txt                   # launch TUI (default)
+    python chainforge.py -f rop.txt -b 00,0a,0d       # with bad chars
     python chainforge.py search -f rop.txt "mov eax"  # CLI search
     python chainforge.py nullcheck 0x10021c89         # check address
     python chainforge.py suggest "copy eax to ebx"    # goal-based suggestions
@@ -21,29 +22,38 @@ for _sub in ('core', 'analysis', 'ui'):
 sys.path.insert(0, _here)
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    # Default to TUI if no subcommand given, or if first arg looks like a flag
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         sys.exit(0)
 
-    cmd = sys.argv[1].lower()
+    # If first arg is a flag (starts with -) or not a known subcommand, launch TUI
+    known_cmds = {"tui", "search", "nullcheck", "suggest", "chain"}
+    if args[0].startswith("-") or args[0].lower() not in known_cmds:
+        from ui.tui import launch_tui
+        launch_tui(args)
+        return
+
+    cmd = args[0].lower()
 
     if cmd == "tui":
         from ui.tui import launch_tui
-        launch_tui(sys.argv[2:])
+        launch_tui(args[1:])
     elif cmd == "search":
         from core.search import cli_search
-        cli_search(sys.argv[2:])
+        cli_search(args[1:])
     elif cmd == "nullcheck":
         from core.nullcheck import cli_nullcheck
-        cli_nullcheck(sys.argv[2:])
+        cli_nullcheck(args[1:])
     elif cmd == "suggest":
         from core.suggest import cli_suggest
-        cli_suggest(sys.argv[2:])
+        cli_suggest(args[1:])
     elif cmd == "chain":
         from core.chain import cli_chain
-        cli_chain(sys.argv[2:])
+        cli_chain(args[1:])
     else:
-        print(f"Unknown command: {cmd}")
+        print(f"Unknown command: {args[0]}")
         print(__doc__)
         sys.exit(1)
 
