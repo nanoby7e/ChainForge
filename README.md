@@ -17,11 +17,43 @@ This tool is intended for authorized security research, penetration testing, and
 ```bash
 # Generate gadgets from a DLL using rp++
 rp-win-x86.exe -f target.dll -r 5 > target_rop.txt
+```
 
-# Launch the TUI (default — no subcommand needed)
-python chainforge.py -f target_rop.txt
+Drop any rp++ `.txt` output files into the `gadgets/` directory and they will be loaded automatically on startup. No flags required.
+
+Example output on startup:
+
+```
+[*] gadgets/ directory: 3 file(s) found
+[+] (auto) Loaded 22,482 gadgets from snfs_rop.txt
+[+] (auto) Loaded 10,629 gadgets from csncdav6_rop.txt
+[+] (auto) Loaded 12,632 gadgets from csmtpav6_rop.txt
+[+] Total: 45,743 gadgets ready
+```
+
+With an additional `-f` file:
+
+```
+[*] gadgets/ directory: 3 file(s) found
+[+] (auto) Loaded 22,482 gadgets from snfs_rop.txt
+[+] (auto) Loaded 10,629 gadgets from csncdav6_rop.txt
+[+] (auto) Loaded 12,632 gadgets from csmtpav6_rop.txt
+[+] (-f)   Loaded  8,241 gadgets from extra_rop.txt
+[+] Total: 53,984 gadgets ready
+```
+
+```bash
+# Launch with auto-loaded gadgets from gadgets/
+python chainforge.py
+
+# Pass additional files alongside gadgets/ contents
+python chainforge.py -f extra_rop.txt
+
+# Override bad chars
+python chainforge.py -b 00,0a,0d,09,20
+
+# Explicit files only (skips gadgets/ if you prefer)
 python chainforge.py -f target_rop.txt -f ntdll_rop.txt
-python chainforge.py -f target_rop.txt -b 00,0a,0d,09,20
 
 # CLI subcommands
 python chainforge.py search -f target_rop.txt "mov eax"
@@ -52,6 +84,7 @@ Press `?` inside the TUI to open the help menu.
 ```
 chainforge/
 ├── chainforge.py          entry point
+├── gadgets/               drop rp++ .txt files here for auto-loading
 ├── core/
 │   ├── search.py          gadget search engine
 │   ├── suggest.py         goal-based suggestions

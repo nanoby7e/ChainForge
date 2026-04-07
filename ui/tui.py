@@ -2160,18 +2160,46 @@ def launch_tui(args=None):
         print(f"[!] Invalid bad chars: {ns.badchars}  (expected format: 00,0a,0d)")
         return
 
+    # Auto-detect gadget files in the gadgets/ directory
+    here = os.path.dirname(os.path.abspath(__file__))
+    gadgets_dir = os.path.join(here, '..', 'gadgets')
+    auto_files = []
+    if os.path.isdir(gadgets_dir):
+        auto_files = sorted(
+            os.path.join(gadgets_dir, f)
+            for f in os.listdir(gadgets_dir)
+            if f.lower().endswith('.txt')
+        )
+
+    # Merge auto-detected and explicitly passed files, preserving order, no duplicates
+    seen = set()
+    all_files = []
+    for path in auto_files + list(ns.files):
+        real = os.path.realpath(path)
+        if real not in seen:
+            seen.add(real)
+            all_files.append(path)
+
+    if auto_files:
+        print(f"[*] gadgets/ directory: {len(auto_files)} file(s) found")
+
     # Pre-load gadget files before entering curses
     preloaded = []
-    for path in ns.files:
+    loaded_paths = []
+    for path in all_files:
         if not os.path.exists(path):
             print(f"[!] File not found: {path}")
             continue
         g = parse_rpp_file(path)
         preloaded.extend(g)
-        print(f"[+] Loaded {len(g):,} gadgets from {os.path.basename(path)}")
+        loaded_paths.append(path)
+        source = "(auto)" if os.path.realpath(path) in {os.path.realpath(f) for f in auto_files} else "(-f)"
+        print(f"[+] {source} Loaded {len(g):,} gadgets from {os.path.basename(path)}")
 
     if preloaded:
         print(f"[+] Total: {len(preloaded):,} gadgets ready")
+    elif not all_files:
+        print(f"[*] No gadget files loaded — drop .txt files in gadgets/ or pass -f")
 
     try:
         curses.wrapper(tui_main, preloaded, ns.files, badchars)
