@@ -12,6 +12,14 @@ This tool is intended for authorized security research, penetration testing, and
 
 ---
 
+## Overview
+
+ChainForge is designed to reduce the manual effort involved in Windows x86 ROP chain development. It processes rp++ gadget output and gives you a searchable, interactive workspace for finding gadgets, understanding what a target DLL can and cannot do, building chains, and validating them against bad character constraints — all in one terminal interface.
+
+All searches and analysis are bad-char aware. Gadgets at addresses containing bad bytes are excluded from results automatically based on your configured constraints.
+
+---
+
 ## Setup
 
 ```bash
@@ -68,14 +76,79 @@ Press `?` inside the TUI to open the help menu.
 
 ## Tabs
 
-| Key | Tab | Description |
-|-----|-----|-------------|
-| 1 | Analysis | Full DLL capability report — register copy matrices, memory operations, stack pivot, path analysis |
-| 2 | Search | Plain text and regex gadget search across all loaded files |
-| 3 | Suggest | Goal-based search — describe what you need (copy eax, write memory, deref esi, zero edx, etc.) |
-| 4 | Chain | Build, annotate, reorder, validate, and export ROP chains as Python pack() code |
-| 5 | NullChk | Check addresses and values against bad char constraints |
-| 6 | RegEx CheatSheet | Browse pre-built regex patterns by category with strict/loose/broad tiers |
+### [1] Analysis
+
+Runs a full capability scan of all loaded gadgets and produces a structured report. Useful at the start of a new target to understand what is and is not available before building a chain.
+
+- Register copy matrices — `mov`, push/pop relay, and `xchg` for every register pair
+- Memory read and write matrices — `mov [PTR], SRC` and `mov DST, [PTR]` for every combination
+- Capture ESP — which registers can receive the stack address
+- Zero register — which registers can be zeroed cleanly
+- Stack pivot options — `xchg eax, esp`, `leave`, and equivalents
+- Key single instructions — `cld`, `cdq`, `pushad`, `popad`, `stosd`, `lodsd`, `nop`
+- 2-hop path analysis — automatically finds relay routes for missing direct register copies, and explicitly lists pairs with no path at all
+
+All counts in the matrices reflect only clean addresses that pass your bad char filter.
+
+### [2] Search
+
+Plain text and regex gadget search across all loaded files simultaneously.
+
+- `/` — new plain text search
+- `x` — new regex search
+- `n` — refine last query (pre-fills the previous search to edit)
+- `c` — clear and return to the intro screen
+- Results are sorted: plain `ret` first, then fewest instructions, then score
+- Each result shows a bad char indicator, ret type, instruction count, address, ASM, and module
+- `Enter` adds the selected gadget to the chain. `a` adds all current results.
+
+The Search tab includes a built-in regex quick-start guide when no search has been run, and a tip pointing to the RegEx CheatSheet tab for pre-built patterns.
+
+### [3] Suggest
+
+Goal-based search — describe what you want the gadget to do in plain language and ChainForge finds candidates across all loaded modules, grouped by category and ranked by quality.
+
+Example goals:
+
+```
+copy eax
+copy eax to ecx
+copy into esi from eax
+deref esi
+write esi
+zero edx
+push eax
+pop ecx
+capture esp
+stack pivot
+call virtualalloc
+```
+
+Results are grouped into strict, loose, and broadest tiers so you can start with the cleanest gadgets and fall back as needed. Use `n` to refine a goal and `c` to return to the goal browser.
+
+### [4] Chain
+
+Interactive chain builder. Gadgets added from Search or Suggest land here.
+
+- Add by address (`a`), add padding (`p`), delete (`d`), reorder (`K`/`J`)
+- Validate all entries for bad chars (`v`)
+- Null-check a specific entry (`c`)
+- Regex search and pick result directly from the chain tab (`r`)
+- Export as Python `pack("<L", ...)` code (`e`)
+- Save to JSON (`S`) and import from JSON (`O`) — import supports replace or append
+- Rename chain (`N`)
+
+On quit, if the chain has unsaved entries, a prompt offers to save before exiting.
+
+### [5] NullChk
+
+Check any address or value against your bad char constraints. Supports single values and batch checking. Shows which specific bytes in the address are problematic.
+
+### [6] RegEx CheatSheet
+
+A browsable reference of pre-built regex patterns pulled from `data/cheatsheet.md`, organized by operation category (MOV, LEA, PUSH/POP, XCHG, arithmetic, logic, memory read/write, string ops, stack pivot, and more).
+
+Each pattern is tagged with its tier — `strict` (clean gadget, ret immediately follows), `loose` (side effects allowed), or `broad` (widest match). Press `Enter` on any pattern to copy it directly into the Search tab and run it immediately.
 
 ---
 
