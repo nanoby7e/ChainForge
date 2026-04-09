@@ -1725,6 +1725,7 @@ def draw_analysis_tab(win, state: AppState):
         g_str = f"  ({len(state.gadgets):,} gadgets from {len(state.files)} file(s))"
         safe_addstr(win, y, 26, g_str, curses.color_pair(C_DIM))
     y += 1
+
     win.hline(y, 0, curses.ACS_HLINE, w)
     y += 1
 
@@ -1799,7 +1800,7 @@ def handle_analysis_key(win, key, state: AppState):
         win.refresh()
 
         from analysis import run_analysis
-        sections = run_analysis(state.gadgets, state.badchars)
+        sections = run_analysis(state.gadgets, state.badchars, files=state.files)
 
         # Flatten for display
         rows = []
@@ -2244,7 +2245,7 @@ def launch_tui(args=None):
         print(f"[*] No gadget files loaded — drop .txt files in gadgets/ or pass -f")
 
     try:
-        curses.wrapper(tui_main, preloaded, ns.files, badchars)
+        curses.wrapper(tui_main, preloaded, loaded_paths, badchars)
     except KeyboardInterrupt:
         pass
     print("\n[+] ChainForge closed.")
