@@ -293,7 +293,7 @@ def draw_search_tab(win, state: AppState):
         idx = start + i
         is_sel = idx == state.selected_idx
         if is_sel:
-            win.hline(row, 0, ' ', w)
+            safe_addstr(win, row, 0, '>', curses.color_pair(C_GOOD) | curses.A_BOLD)
 
         clean, _ = check_value(g.address, list(state.badchars))
         sc = curses.color_pair(C_GOOD) if clean else curses.color_pair(C_BAD)
@@ -874,7 +874,7 @@ def draw_suggest_tab(win, state: AppState):
                 abs_idx = -1
             is_sel = (abs_idx == state.suggest_sel)
             if is_sel:
-                win.hline(row, 0, ' ', w)
+                safe_addstr(win, row, 0, '>', curses.color_pair(C_GOOD) | curses.A_BOLD)
 
             # ── Bad char indicator ────────────────────────────────────────────
             clean, _ = check_value(g.address, list(state.badchars))
@@ -1044,7 +1044,7 @@ def draw_chain_tab(win, state: AppState):
         idx = start + i
         is_sel = idx == state.selected_idx
         if is_sel:
-            win.hline(row, 0, ' ', w)
+            safe_addstr(win, row, 0, '>', curses.color_pair(C_GOOD) | curses.A_BOLD)
 
         issue = issues.get(idx)
         s_attr = curses.color_pair(C_BAD) if issue else curses.color_pair(C_GOOD)
@@ -1582,7 +1582,7 @@ def draw_cheatsheet_tab(win, state: AppState):
             # attr is the tag string for patterns
             tag = attr   # repurposed field
             if is_sel:
-                win.hline(y, 0, ' ', w)
+                safe_addstr(win, y, 0, '>', curses.color_pair(C_GOOD) | curses.A_BOLD)
 
             # Tag badge — colored by type
             TAG_COLORS = {
