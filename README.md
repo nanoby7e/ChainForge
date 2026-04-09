@@ -29,6 +29,8 @@ rp-win-x86.exe -f target.dll -r 5 > target_rop.txt
 
 Drop any rp++ `.txt` output files into the `gadgets/` directory and they will be loaded automatically on startup. No flags required.
 
+Only `.txt` files are loaded. Any other file types in `gadgets/` are ignored and flagged in the terminal output, with the exception of `.gitkeep` which is silently ignored. This helps catch accidental drops of wrong file types before a session.
+
 ```
 [*] gadgets/ directory: 3 file(s) found
 [+] (auto) Loaded 18,432 gadgets from module_a_rop.txt

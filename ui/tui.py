@@ -2224,12 +2224,18 @@ def launch_tui(args=None):
     here = os.path.dirname(os.path.abspath(__file__))
     gadgets_dir = os.path.join(here, '..', 'gadgets')
     auto_files = []
+    IGNORED = {'.gitkeep', 'gitkeep.txt'}
     if os.path.isdir(gadgets_dir):
+        all_dir = os.listdir(gadgets_dir)
         auto_files = sorted(
             os.path.join(gadgets_dir, f)
-            for f in os.listdir(gadgets_dir)
-            if f.lower().endswith('.txt')
+            for f in all_dir
+            if f.lower().endswith('.txt') and f not in IGNORED
         )
+        # Warn about any files that are not .txt and not intentionally ignored
+        skipped = [f for f in all_dir if not f.lower().endswith('.txt') and f not in IGNORED]
+        for f in sorted(skipped):
+            print(f"[*] gadgets/ skipped (not a .txt file): {f}")
 
     # Merge auto-detected and explicitly passed files, preserving order, no duplicates
     seen = set()
