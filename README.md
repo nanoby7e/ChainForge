@@ -31,10 +31,36 @@ Drop any rp++ `.txt` output files into the `gadgets/` directory and they will be
 
 ```
 [*] gadgets/ directory: 3 file(s) found
-[+] (auto) Loaded 22,482 gadgets from snfs_rop.txt
-[+] (auto) Loaded 10,629 gadgets from csncdav6_rop.txt
-[+] (auto) Loaded 12,632 gadgets from csmtpav6_rop.txt
-[+] Total: 45,743 gadgets ready
+[+] (auto) Loaded 18,432 gadgets from module_a_rop.txt
+[+] (auto) Loaded 11,205 gadgets from module_b_rop.txt
+[+] (auto) Loaded 9,847 gadgets from module_c_rop.txt
+[*] Bad chars: 0x0, 0xa, 0xd
+[+] Total: 39,484 gadgets ready
+```
+
+With an additional `-f` file:
+
+```
+[*] gadgets/ directory: 3 file(s) found
+[+] (auto) Loaded 18,432 gadgets from module_a_rop.txt
+[+] (auto) Loaded 11,205 gadgets from module_b_rop.txt
+[+] (auto) Loaded 9,847 gadgets from module_c_rop.txt
+[+] (-f)   Loaded  7,612 gadgets from extra_rop.txt
+[*] Bad chars: 0x0, 0xa, 0xd
+[+] Total: 47,096 gadgets ready
+```
+
+After closing, any actions taken during the session are printed to the terminal:
+
+```
+[+] Analysis complete: 39,484 gadgets across 3 file(s)
+[*] Bad chars changed: 0x0, 0xa, 0xb, 0xd
+[+] Chain saved: my_chain.json  (12 entries)
+[+] Chain imported (replaced): base_chain.json  —  8 entries
+[+] Chain imported (appended): extra.json  —  4 entries  (16 total)
+[!] Gadget file not found: missing_rop.txt
+[!] Chain import failed — file not found: missing.json
+[+] ChainForge closed.
 ```
 
 ```bash
@@ -48,7 +74,7 @@ python chainforge.py -f extra_rop.txt
 python chainforge.py -b 00,0a,0b,0c,0d,09,20
 
 # Explicit files only
-python chainforge.py -f snfs_rop.txt -f ntdll_rop.txt -b 00,0a,0d
+python chainforge.py -f module_a_rop.txt -f module_b_rop.txt -b 00,0a,0d
 
 # CLI subcommands
 python chainforge.py search -f target_rop.txt "mov eax"
@@ -65,20 +91,18 @@ Press `?` inside the TUI to open the help menu.
 
 ### [1] Analysis
 
-Full DLL capability scan. Run this first on a new target to understand what is and is not available before building a chain. All counts reflect only gadgets at clean addresses that pass your bad char filter.
+Full DLL capability scan. Run this first on a new target to understand what is and is not available before building a chain. All counts reflect only gadgets at clean addresses that pass your bad char filter. The overview lists every gadget file loaded, total gadget count, bad chars, and clean gadget count.
 
 - **EAX Hub Map** — all routes to and from EAX with gadget counts and best examples, since EAX is the primary relay register in most chains
-- **Multiple-Hop Path Analysis** — automatically finds 2-hop relay routes for missing direct register copies, with best gadget shown for each leg
+- **Multiple-Hop Path Analysis** — automatically finds relay routes for missing direct register copies, with best gadget shown per leg
 - **Register copy matrices** — `mov`, push/pop relay, and `xchg` counts for every register pair
 - **Memory read/write matrices** — `mov [PTR], SRC` and `mov DST, [PTR]` for every combination
-- **Inc / Dec / Neg** — per-register counts for single-register arithmetic
 - **Add / Sub matrices** — register-to-register arithmetic counts (ADD and SUB shown separately)
+- **Inc / Dec / Neg** — per-register counts for single-register arithmetic
 - **Capture ESP** — which registers can receive the stack pointer
 - **Zero register** — which registers can be zeroed cleanly
 - **Stack pivot** — available pivot gadgets
 - **Key single instructions** — `cld`, `cdq`, `pushad`, `popad`, `stosd`, `lodsd`, `nop`
-
-The analysis overview lists every gadget file loaded, the total gadget count, bad chars, and clean gadget count.
 
 ### [2] Search
 
@@ -91,7 +115,7 @@ Plain text and regex gadget search across all loaded files simultaneously. Resul
 - `Enter` — add selected gadget to chain
 - `a` — add all current results to chain
 
-Search by address as well as ASM — enter `0x10012f97` or a partial `10012f` to look up gadgets by address.
+Search by address as well as ASM — enter a full address or a partial to find gadgets by location.
 
 The intro screen includes a regex quick-start guide and points to the RegEx CheatSheet tab for pre-built patterns.
 
