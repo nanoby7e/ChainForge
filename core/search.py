@@ -185,10 +185,12 @@ def search_gadgets(
     try:
         if regex_mode:
             compiled = re.compile(query, re.IGNORECASE)
-            match_fn = lambda g: bool(compiled.search(g.asm))
+            match_fn = lambda g: (bool(compiled.search(g.asm)) or
+                                  bool(compiled.search(g.addr_str)))
         else:
-            q = query.lower()
-            match_fn = lambda g: q in g.asm.lower()
+            q = query.lower().lstrip('0x')
+            match_fn = lambda g: (q in g.asm.lower() or
+                                  q in g.addr_str.lower().lstrip('0x'))
     except re.error as e:
         print(f"[!] Invalid regex: {e}", file=sys.stderr)
         return []
