@@ -264,7 +264,7 @@ def draw_search_tab(win, state: AppState):
         q_text = state.search_query[:w - 18]
         safe_addstr(win, y, 18, q_text, curses.color_pair(C_GOOD))
     else:
-        hint = "/=plain search    x=regex"
+        hint = "/=plain search  |  addr: 0x10012f97 or partial 10012f"
         safe_addstr(win, y, 18, hint[:w - 18], curses.color_pair(C_DIM))
     y += 1
 
@@ -344,10 +344,16 @@ def draw_search_tab(win, state: AppState):
                 safe_addstr(win, r, c, text[:w - c - 1], attr)
 
             sh(row, 2, "Plain search  (/  or  n to refine)", CY)
-            sh(row, 20, "Matches any gadget containing the exact text you type.", DIM)
+            sh(row, 42, "Matches ASM text or gadget address.", DIM)
             row += 1
-            sh(row, 4, "mov eax", GD)
-            sh(row, 15, "->  any gadget with 'mov eax' anywhere in it", DIM)
+            sh(row, 4, "mov eax",     GD)
+            sh(row, 18, "->  any gadget containing 'mov eax' in the ASM", DIM)
+            row += 1
+            sh(row, 4, "0x10012f97",  GD)
+            sh(row, 18, "->  look up a gadget by full address", DIM)
+            row += 1
+            sh(row, 4, "10012f",      GD)
+            sh(row, 18, "->  partial address — returns all gadgets in that range", DIM)
             row += 2
 
             sh(row, 2, "Regex search  (x)", CY)
@@ -379,7 +385,7 @@ def draw_search_tab(win, state: AppState):
 
 
     safe_addstr(win, h - 2, 2,
-                "/=new search  x=new regex  n=refine  c=clear  UP/DN=scroll  Enter=add to chain  L=load",
+                "/=search (ASM or address)  x=regex  n=refine  c=clear  UP/DN=scroll  Enter=add to chain  L=load",
                 curses.color_pair(C_DIM))
 
 
