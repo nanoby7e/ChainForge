@@ -1,6 +1,6 @@
 # ChainForge
 
-A terminal-based Windows ROP chain development tool. Originally built alongside the OffSec EXP-301 (OSED) course. Pure Python 3.6+, no dependencies.
+A terminal-based Windows x86 ROP chain development tool. Originally built alongside the OffSec EXP-301 (OSED) course. Pure Python 3.6+, no dependencies.
 
 Requires rp++ to generate gadget files from target binaries.
 
@@ -14,9 +14,9 @@ This tool is intended for authorized security research, penetration testing, and
 
 ## Overview
 
-ChainForge is designed to reduce the manual effort involved in Windows x86 ROP chain development. It processes rp++ gadget output and gives you a searchable, interactive workspace for finding gadgets, understanding what a target DLL can and cannot do, building chains, and validating them against bad character constraints — all in one terminal interface.
+ChainForge reduces the manual effort involved in Windows x86 ROP chain development. It processes rp++ gadget output and provides a searchable, interactive workspace for finding gadgets, understanding what a target DLL can and cannot do, building and validating chains, and exporting them — all in one terminal interface.
 
-All searches and analysis are bad-char aware. Gadgets at addresses containing bad bytes are excluded from results automatically based on your configured constraints.
+All searches and analysis are bad-char aware. Gadgets at addresses containing bad bytes are excluded automatically based on your configured constraints.
 
 ---
 
@@ -29,8 +29,6 @@ rp-win-x86.exe -f target.dll -r 5 > target_rop.txt
 
 Drop any rp++ `.txt` output files into the `gadgets/` directory and they will be loaded automatically on startup. No flags required.
 
-Example output on startup:
-
 ```
 [*] gadgets/ directory: 3 file(s) found
 [+] (auto) Loaded 22,482 gadgets from snfs_rop.txt
@@ -39,29 +37,18 @@ Example output on startup:
 [+] Total: 45,743 gadgets ready
 ```
 
-With an additional `-f` file:
-
-```
-[*] gadgets/ directory: 3 file(s) found
-[+] (auto) Loaded 22,482 gadgets from snfs_rop.txt
-[+] (auto) Loaded 10,629 gadgets from csncdav6_rop.txt
-[+] (auto) Loaded 12,632 gadgets from csmtpav6_rop.txt
-[+] (-f)   Loaded  8,241 gadgets from extra_rop.txt
-[+] Total: 53,984 gadgets ready
-```
-
 ```bash
-# Launch with auto-loaded gadgets from gadgets/
+# Launch (auto-loads from gadgets/)
 python chainforge.py
 
-# Pass additional files alongside gadgets/ contents
+# Additional files alongside gadgets/
 python chainforge.py -f extra_rop.txt
 
-# Override bad chars
-python chainforge.py -b 00,0a,0d,09,20
+# Custom bad chars
+python chainforge.py -b 00,0a,0b,0c,0d,09,20
 
-# Explicit files only (skips gadgets/ if you prefer)
-python chainforge.py -f target_rop.txt -f ntdll_rop.txt
+# Explicit files only
+python chainforge.py -f snfs_rop.txt -f ntdll_rop.txt -b 00,0a,0d
 
 # CLI subcommands
 python chainforge.py search -f target_rop.txt "mov eax"
@@ -78,77 +65,73 @@ Press `?` inside the TUI to open the help menu.
 
 ### [1] Analysis
 
-Runs a full capability scan of all loaded gadgets and produces a structured report. Useful at the start of a new target to understand what is and is not available before building a chain.
+Full DLL capability scan. Run this first on a new target to understand what is and is not available before building a chain. All counts reflect only gadgets at clean addresses that pass your bad char filter.
 
-- Register copy matrices — `mov`, push/pop relay, and `xchg` for every register pair
-- Memory read and write matrices — `mov [PTR], SRC` and `mov DST, [PTR]` for every combination
-- Capture ESP — which registers can receive the stack address
-- Zero register — which registers can be zeroed cleanly
-- Stack pivot options — `xchg eax, esp`, `leave`, and equivalents
-- Key single instructions — `cld`, `cdq`, `pushad`, `popad`, `stosd`, `lodsd`, `nop`
-- 2-hop path analysis — automatically finds relay routes for missing direct register copies, and explicitly lists pairs with no path at all
+- **EAX Hub Map** — all routes to and from EAX with gadget counts and best examples, since EAX is the primary relay register in most chains
+- **Multiple-Hop Path Analysis** — automatically finds 2-hop relay routes for missing direct register copies, with best gadget shown for each leg
+- **Register copy matrices** — `mov`, push/pop relay, and `xchg` counts for every register pair
+- **Memory read/write matrices** — `mov [PTR], SRC` and `mov DST, [PTR]` for every combination
+- **Inc / Dec / Neg** — per-register counts for single-register arithmetic
+- **Add / Sub matrices** — register-to-register arithmetic counts (ADD and SUB shown separately)
+- **Capture ESP** — which registers can receive the stack pointer
+- **Zero register** — which registers can be zeroed cleanly
+- **Stack pivot** — available pivot gadgets
+- **Key single instructions** — `cld`, `cdq`, `pushad`, `popad`, `stosd`, `lodsd`, `nop`
 
-All counts in the matrices reflect only clean addresses that pass your bad char filter.
+The analysis overview lists every gadget file loaded, the total gadget count, bad chars, and clean gadget count.
 
 ### [2] Search
 
-Plain text and regex gadget search across all loaded files simultaneously.
+Plain text and regex gadget search across all loaded files simultaneously. Results are sorted: plain `ret` first, then fewest instructions, then score. Each result shows a bad char indicator, ret type, instruction count, address, ASM, and source module.
 
-- `/` — new plain text search
-- `x` — new regex search
-- `n` — refine last query (pre-fills the previous search to edit)
-- `c` — clear and return to the intro screen
-- Results are sorted: plain `ret` first, then fewest instructions, then score
-- Each result shows a bad char indicator, ret type, instruction count, address, ASM, and module
-- `Enter` adds the selected gadget to the chain. `a` adds all current results.
+- `/` — new plain text search (starts empty)
+- `x` — new regex search (starts empty)
+- `n` — refine — pre-fills the last query to edit and re-run
+- `c` — clear results and return to the intro screen
+- `Enter` — add selected gadget to chain
+- `a` — add all current results to chain
 
-The Search tab includes a built-in regex quick-start guide when no search has been run, and a tip pointing to the RegEx CheatSheet tab for pre-built patterns.
+Search by address as well as ASM — enter `0x10012f97` or a partial `10012f` to look up gadgets by address.
+
+The intro screen includes a regex quick-start guide and points to the RegEx CheatSheet tab for pre-built patterns.
 
 ### [3] Suggest
 
-Goal-based search — describe what you want the gadget to do in plain language and ChainForge finds candidates across all loaded modules, grouped by category and ranked by quality.
-
-Example goals:
+Goal-based search. Describe what you want in plain language and ChainForge searches all loaded modules, returning results grouped by category and ranked by quality (strict/clean first).
 
 ```
-copy eax
-copy eax to ecx
-copy into esi from eax
-deref esi
-write esi
-zero edx
-push eax
-pop ecx
-capture esp
-stack pivot
-call virtualalloc
+copy eax              copy eax to ecx       copy into esi from eax
+deref esi             write esi             zero edx
+push eax              pop ecx               capture esp
+stack pivot           call virtualalloc
 ```
 
-Results are grouped into strict, loose, and broadest tiers so you can start with the cleanest gadgets and fall back as needed. Use `n` to refine a goal and `c` to return to the goal browser.
+- `/` — new goal (starts empty)
+- `n` — refine last goal
+- `c` — return to goal browser
+- `Enter` — add selected gadget to chain
 
 ### [4] Chain
 
-Interactive chain builder. Gadgets added from Search or Suggest land here.
+Interactive chain builder. Gadgets added from Search or Suggest appear here.
 
-- Add by address (`a`), add padding (`p`), delete (`d`), reorder (`K`/`J`)
-- Validate all entries for bad chars (`v`)
-- Null-check a specific entry (`c`)
-- Regex search and pick result directly from the chain tab (`r`)
-- Export as Python `pack("<L", ...)` code (`e`)
-- Save to JSON (`S`) and import from JSON (`O`) — import supports replace or append
-- Rename chain (`N`)
+- `a` add by address, `p` add padding, `d` delete, `K`/`J` reorder
+- `v` validate all entries for bad chars
+- `c` null-check selected entry
+- `r` regex search and pick result without leaving the tab
+- `e` export as Python `pack("<L", ...)` code
+- `S` save to JSON, `O` import from JSON (replace or append)
+- `N` rename chain
 
-On quit, if the chain has unsaved entries, a prompt offers to save before exiting.
+On quit, if the chain has unsaved entries, a save prompt appears.
 
 ### [5] NullChk
 
-Check any address or value against your bad char constraints. Supports single values and batch checking. Shows which specific bytes in the address are problematic.
+Check any address or value against your bad char constraints. Shows which specific bytes are problematic and supports batch checking.
 
 ### [6] RegEx CheatSheet
 
-A browsable reference of pre-built regex patterns pulled from `data/cheatsheet.md`, organized by operation category (MOV, LEA, PUSH/POP, XCHG, arithmetic, logic, memory read/write, string ops, stack pivot, and more).
-
-Each pattern is tagged with its tier — `strict` (clean gadget, ret immediately follows), `loose` (side effects allowed), or `broad` (widest match). Press `Enter` on any pattern to copy it directly into the Search tab and run it immediately.
+Browsable reference of pre-built regex patterns from `data/cheatsheet.md`, organized by category. Each pattern is tagged `strict`, `loose`, or `broad`. Press `Enter` on any pattern to copy it to the Search tab and run it immediately.
 
 ---
 

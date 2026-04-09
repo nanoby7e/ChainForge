@@ -71,6 +71,7 @@ class AppState:
         self.regex_mode: bool = False     # True when last search was regex
         self.suggest_sel: int = 0         # selected gadget row index in suggest
         self.cheat_scroll: int = 0        # scroll offset for cheatsheet tab
+        self.session_log: list = []        # actions buffered during curses session
         self.cheat_filter: str = ""       # filter string for cheatsheet tab
         self.cheat_sel: int = 0           # selected entry in cheatsheet
         self.analysis_rows: list = []     # flat display rows from last analysis
@@ -494,11 +495,13 @@ def handle_search_key(win, key, state: AppState):
                 new_g = parse_rpp_file(path)
                 state.gadgets.extend(new_g)
                 state.files.append(path)
+                state.session_log.append(f"[+] Gadgets loaded: {path}  ({len(new_g):,} gadgets)")
                 state.status_msg = (f"Loaded {len(new_g):,} gadgets from "
                                     f"{os.path.basename(path)} "
                                     f"(total: {len(state.gadgets):,})")
             else:
                 state.status_msg = f"File not found: {path}"
+                state.session_log.append(f"[!] Gadget file not found: {path}")
 
 
 # ── Tab 2: Suggest ─────────────────────────────────────────────────────────────
@@ -1014,10 +1017,12 @@ def handle_suggest_key(win, key, state: AppState):
             if os.path.exists(path):
                 new_g = parse_rpp_file(path)
                 state.gadgets.extend(new_g)
+                state.session_log.append(f"[+] Gadgets loaded: {path}  ({len(new_g):,} gadgets)")
                 state.status_msg = (f"Loaded {len(new_g):,} gadgets from "
                                     f"{os.path.basename(path)}")
             else:
                 state.status_msg = f"File not found: {path}"
+                state.session_log.append(f"[!] Gadget file not found: {path}")
 
 
 # ── Tab 3: Chain ───────────────────────────────────────────────────────────────
@@ -1134,6 +1139,7 @@ def handle_chain_key(win, key, state: AppState):
             state.status_msg = f"Moved [{idx}] down  ->  [{idx + 1}]"
 
     elif key == ord('e'):
+        state.session_log.append(f"[+] Chain exported to terminal  ({len(chain.entries)} entries)")
         _popup_export(win, state)
 
     elif key == ord('v'):
@@ -1150,8 +1156,10 @@ def handle_chain_key(win, key, state: AppState):
                 with open(path.strip(), "w") as f:
                     f.write(chain.to_json())
                 state.status_msg = f"Saved to {path.strip()}"
+                state.session_log.append(f"[+] Chain saved: {path.strip()}  ({len(chain.entries)} entries)")
             except Exception as e:
                 state.status_msg = f"Save failed: {e}"
+                state.session_log.append(f"[!] Chain save failed: {e}")
 
     elif key == ord('O'):
         path = read_line(win, h - 5, 2, "Import chain JSON: ")
@@ -1159,6 +1167,7 @@ def handle_chain_key(win, key, state: AppState):
             path = path.strip()
             if not os.path.exists(path):
                 state.status_msg = f"File not found: {path}"
+                state.session_log.append(f"[!] Chain import failed — file not found: {path}")
             else:
                 try:
                     from chain import RopChain
@@ -1175,16 +1184,19 @@ def handle_chain_key(win, key, state: AppState):
                         state.scroll_offset = 0
                         state.status_msg = (f"Imported '{loaded.name}' — "
                                             f"{n} entries (replaced)")
+                        state.session_log.append(f"[+] Chain imported (replaced): {path}  —  {n} entries")
                     elif choice and choice.strip().lower() == 'a':
                         for entry in loaded.entries:
                             state.chain.entries.append(entry)
                         state.status_msg = (f"Imported '{loaded.name}' — "
                                             f"{n} entries appended "
                                             f"({len(state.chain.entries)} total)")
+                        state.session_log.append(f"[+] Chain imported (appended): {path}  —  {n} entries  ({len(state.chain.entries)} total)")
                     else:
                         state.status_msg = "Import cancelled"
                 except Exception as e:
                     state.status_msg = f"Import failed: {e}"
+                    state.session_log.append(f"[!] Chain import failed: {e}")
 
     elif key == ord('N'):
         name = read_line(win, h - 5, 2, "Chain name: ")
@@ -1393,8 +1405,9 @@ def handle_nullcheck_key(win, key, state: AppState):
                 state.badchars = bytes(int(x.strip(), 16)
                                        for x in bc_str.split(","))
                 state.chain.badchars = state.badchars
-                state.status_msg = (f"Bad chars: "
-                                    f"{','.join(hex(b) for b in state.badchars)}")
+                bc_display = ','.join(hex(b) for b in state.badchars)
+                state.status_msg = f"Bad chars: {bc_display}"
+                state.session_log.append(f"[*] Bad chars changed: {bc_display}")
             except ValueError:
                 state.status_msg = "Invalid format — use: 00,0a,0d"
 
@@ -1816,6 +1829,7 @@ def handle_analysis_key(win, key, state: AppState):
         state.analysis_scroll = 0
         state.analysis_done = True
         state.status_msg = f"Analysis complete — {len(rows)} lines  |  UP/DN to scroll"
+        state.session_log.append(f"[+] Analysis complete: {len(state.gadgets):,} gadgets across {len(state.files)} file(s)")
 
     elif key == ord('c'):
         state.analysis_done = False
@@ -1844,6 +1858,7 @@ def handle_analysis_key(win, key, state: AppState):
                 state.status_msg = (f"Loaded {len(new_g):,} gadgets — press a to re-run analysis")
             else:
                 state.status_msg = f"File not found: {path}"
+                state.session_log.append(f"[!] Gadget file not found: {path}")
 
 
 # ── Help popup ─────────────────────────────────────────────────────────────────
@@ -1966,6 +1981,7 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
     stdscr.timeout(-1)
 
     state = AppState()
+    tui_main._last_state = state   # expose for post-session log flush
 
     # Apply preloaded gadgets and settings from CLI args
     if preloaded_gadgets:
@@ -2120,6 +2136,7 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
                         with open(path.strip(), "w") as f:
                             f.write(state.chain.to_json())
                         state.status_msg = f"Saved to {path.strip()}"
+                        state.session_log.append(f"[+] Chain saved on quit: {path.strip()}  ({len(state.chain.entries)} entries)")
                         break   # saved — now quit
                     except Exception as e:
                         state.status_msg = f"Save failed: {e}"
@@ -2239,6 +2256,8 @@ def launch_tui(args=None):
         source = "(auto)" if os.path.realpath(path) in {os.path.realpath(f) for f in auto_files} else "(-f)"
         print(f"[+] {source} Loaded {len(g):,} gadgets from {os.path.basename(path)}")
 
+    bc_str = ', '.join(hex(b) for b in badchars)
+    print(f"[*] Bad chars: {bc_str}")
     if preloaded:
         print(f"[+] Total: {len(preloaded):,} gadgets ready")
     elif not all_files:
@@ -2248,4 +2267,11 @@ def launch_tui(args=None):
         curses.wrapper(tui_main, preloaded, loaded_paths, badchars)
     except KeyboardInterrupt:
         pass
-    print("\n[+] ChainForge closed.")
+    # Flush any actions that happened inside curses (where print is suppressed)
+    if hasattr(tui_main, '_last_state') and tui_main._last_state:
+        log = tui_main._last_state.session_log
+        if log:
+            print()
+            for entry in log:
+                print(entry)
+    print("[+] ChainForge closed.")

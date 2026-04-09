@@ -301,6 +301,29 @@ def run_analysis(gadgets: List[Gadget], badchars: bytes, files: list = None) -> 
     mr_lines.insert(2, "")
     sections.append(("Memory Read Matrix  (mov DST, [PTR])", "info", mr_lines))
 
+    # ── Add / Sub ─────────────────────────────────────────────────────────────
+    def add_count(dst, src):
+        return len(_hit(gadgets, rf'add\s+{dst},\s*{src}.*ret', badchars))
+
+    def sub_count(dst, src):
+        return len(_hit(gadgets, rf'sub\s+{dst},\s*{src}.*ret', badchars))
+
+    add_lines = []
+    add_lines.append("  How to read:  row = destination register,  column = source register")
+    add_lines.append("  ADD and SUB shown as separate matrices below")
+    add_lines.append("")
+    add_lines.append("  ADD  (add DST, SRC)")
+    add_lines.append("")
+    for l in make_matrix("DST (row)", "SRC (columns) ->", add_count):
+        add_lines.append(l)
+    add_lines.append("")
+    add_lines.append("  SUB  (sub DST, SRC)")
+    add_lines.append("")
+    for l in make_matrix("DST (row)", "SRC (columns) ->", sub_count):
+        add_lines.append(l)
+
+    sections.append(("Add / Sub Matrix  (register to register)", "info", add_lines))
+
     # ── Inc / Dec / Neg ──────────────────────────────────────────────────────
     incdec_lines = []
     incdec_lines.append("  How to read:  count of clean gadgets for each operation on that register")
@@ -313,44 +336,6 @@ def run_analysis(gadgets: List[Gadget], badchars: bytes, files: list = None) -> 
         neg_n = len(_hit(gadgets, rf'neg\s+{reg}.*ret', badchars))
         incdec_lines.append(f"    {reg:<6}  {inc_n:>6}  {dec_n:>6}  {neg_n:>6}")
     sections.append(("Inc / Dec / Neg  (per register counts)", "info", incdec_lines))
-
-    # ── Add / Sub ─────────────────────────────────────────────────────────────
-    addsub_hdr = ["  How to read:  row = destination register,  column = source register",
-                  "  Add matrix shown first then Sub matrix", ""]
-    # Add matrix
-    add_lines = list(addsub_hdr)
-    add_lines.append(f"    ADD")
-    add_col_hdr = "         " + "".join(f"  {r:>5}" for r in REGS)
-    add_lines.append(add_col_hdr)
-    add_lines.append("         " + "  -----" * len(REGS))
-    mid = len(REGS) // 2
-    for i, dst in enumerate(REGS):
-        gutter = f"  DST  " if i == mid else "       "
-        row = f"  {dst:>5}  "
-        for src in REGS:
-            if src == dst:
-                row += "  ----"
-                continue
-            n = len(_hit(gadgets, rf'add\s+{dst},\s*{src}.*ret', badchars))
-            row += f"  {n:>5}" if n else "      0"
-        add_lines.append(row)
-    add_lines.append("")
-
-    # Sub matrix
-    add_lines.append(f"    SUB")
-    add_lines.append(add_col_hdr)
-    add_lines.append("         " + "  -----" * len(REGS))
-    for i, dst in enumerate(REGS):
-        row = f"  {dst:>5}  "
-        for src in REGS:
-            if src == dst:
-                row += "  ----"
-                continue
-            n = len(_hit(gadgets, rf'sub\s+{dst},\s*{src}.*ret', badchars))
-            row += f"  {n:>5}" if n else "      0"
-        add_lines.append(row)
-
-    sections.append(("Add / Sub Matrix  (register to register)", "info", add_lines))
 
     # ── 9. Capture ESP ───────────────────────────────────────────────────────
     esp_lines = []
