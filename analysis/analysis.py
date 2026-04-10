@@ -1,182 +1,260 @@
 """
 analysis.py — ChainForge DLL capability analysis
-Scans a loaded gadget list and produces a structured summary of what
-register operations, memory operations, and special instructions exist.
-Surfaces gaps and suggests multi-step paths for missing direct routes.
+
+Architecture:
+  - Module-level constants: REGS, destructive/caution patterns
+  - Module-level pure helpers: _grade_asm, _best_candidates, _path_grade
+  - Per-section builder functions: each returns (title, status, lines)
+  - run_analysis(): orchestrator — calls builders, returns section list
 """
 
 import re
 from typing import List, Dict, Tuple, Optional
 from search import Gadget, search_gadgets
 
+# ── Register set ──────────────────────────────────────────────────────────────
 REGS = ['eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp']
 
+# ── Destructive / AV-prone patterns ──────────────────────────────────────────
+_DESTR = re.compile(
+    r'(\bhlt\b'
+    r'|\bud2\b'
+    r'|\bint\s+3\b'
+    r'|\bint\s+0x80\b'
+    r'|\brep\s+(movsd|stosd|scasd|lodsd|cmpsb|stosb|movsb)\b'
+    r'|\bpop\s+(ds|es|ss|fs|gs)\b'
+    r'|\b(in|out)\s+'
+    r'|\b(idiv|div)\s+'
+    r'|\blgdt\b|\blidt\b|\blldt\b'
+    r'|\b(or|add|sub|and|xor)\s+esp,\s*(dword\s*)?\['
+    r'|\bmov\s+esp,\s*(dword\s*)?\[)',
+    re.IGNORECASE
+)
 
-def _hit(gadgets, pattern, bad):
-    return search_gadgets(gadgets, pattern, badchars=bad,
+_CAUTION = re.compile(
+    r'(\b(or|add|sub|and|xor)\s+e[a-z]{2},\s*(dword\s*)?\[(?!esp)'
+    r'|\bretn\s+0x(?!0+\b)[0-9a-fA-F]+'
+    r'|\bleave\b)',
+    re.IGNORECASE
+)
+
+# Matches hex immediates in ASM (e.g. 0x10020E0B) for bad-byte checking
+_re_imm = re.compile(r'\b0x[0-9a-fA-F]{4,8}\b')
+
+
+# ── Pure helper functions ─────────────────────────────────────────────────────
+
+def _hit(gadgets: List[Gadget], pattern: str, badchars: bytes) -> List[Gadget]:
+    """Search gadgets with regex, filtering bad chars."""
+    return search_gadgets(gadgets, pattern, badchars=badchars,
                           regex_mode=True, max_results=0)
 
 
-def _best(results):
-    return results[0].asm if results else None
+def _grade_asm(asm: str) -> Tuple[str, str]:
+    """Return (grade, note): GOOD / CAUTION / PROBLEMATIC."""
+    m = _DESTR.search(asm)
+    if m:
+        return 'PROBLEMATIC', m.group(0).strip()
+    m = _CAUTION.search(asm)
+    if m:
+        return 'CAUTION', m.group(0).strip()
+    return 'GOOD', ''
 
 
-def run_analysis(gadgets: List[Gadget], badchars: bytes, files: list = None) -> List[Tuple[str, str, List[str]]]:
+def _best_candidates(gadgets: List[Gadget], badchars: bytes,
+                     patterns: List[str], n: int = 2) -> list:
     """
-    Return a list of (section, status, [lines]) tuples.
-    status: 'ok' | 'warn' | 'missing' | 'info'
+    Return up to n (gadget, grade, note) tuples across patterns.
+    Sorted GOOD first, CAUTION second. PROBLEMATIC excluded.
     """
-    sections = []
+    ORDER = {'GOOD': 0, 'CAUTION': 1}
+    seen = set()
+    candidates = []
+    for pat in patterns:
+        for g in _hit(gadgets, pat, badchars):
+            if g.addr_str in seen:
+                continue
+            seen.add(g.addr_str)
+            grade, note = _grade_asm(g.asm)
+            if grade != 'PROBLEMATIC':
+                candidates.append((g, grade, note))
+            if len(candidates) >= n * 2:
+                break
+    candidates.sort(key=lambda x: ORDER.get(x[1], 2))
+    # Filter out gadgets whose ASM immediates contain bad bytes
+    candidates = [c for c in candidates if not _imm_has_badchar(c[0].asm, badchars)]
+    return candidates[:n]
 
-    # ── 1. Overview ──────────────────────────────────────────────────────────
-    import os as _os
-    overview_lines = []
+
+def _copy_candidates(gadgets, badchars, src, dst, n=2):
+    """Best candidates for a direct register copy src -> dst."""
+    return _best_candidates(gadgets, badchars, [
+        rf'^mov\s+{dst},\s*{src}\s*;\s*ret',
+        rf'^push\s+{src}\s*;\s*pop\s+{dst}\s*;\s*ret',
+        rf'mov\s+{dst},\s*{src}.*ret',
+        rf'push\s+{src}.*pop\s+{dst}.*ret',
+        rf'xchg\s+({dst},\s*{src}|{src},\s*{dst}).*ret',
+    ], n)
+
+
+def _path_grade(leg_candidates: list) -> str:
+    """Worst grade across all legs determines path grade."""
+    grades = [c[1] for leg in leg_candidates for c in leg]
+    if 'PROBLEMATIC' in grades: return 'PROBLEMATIC'
+    if 'CAUTION' in grades:     return 'CAUTION'
+    return 'GOOD'
+
+
+def _render_candidates(cands, first_label, indent, lines, asm_w=70):
+    """
+    Append candidate lines to `lines`. Only shows second if first is flagged.
+    """
+    pad = ' ' * indent
+    label_w = len(first_label)
+    for i, (g, grade, note) in enumerate(cands):
+        if i == 1 and cands[0][1] == 'GOOD':
+            break
+        lbl  = first_label if i == 0 else ' ' * (label_w + 2)
+        flag = f'  !! {note}' if grade != 'GOOD' else ''
+        lines.append(f'{pad}[{lbl}]  {g.addr_str}  {g.asm[:asm_w]}{flag}')
+        if i == 0 and grade != 'GOOD' and len(cands) > 1:
+            lines.append(f'{pad}{" " * (label_w + 2)}  (alt:)')
+
+
+# ── Matrix builder ────────────────────────────────────────────────────────────
+
+_GUTTER = 14
+
+
+def _make_matrix(row_label, col_label_str, count_fn, best_fn=None,
+                 skip_same=True, best_w=75):
+    """Build a labelled matrix. Optionally appends a best-gadget column."""
+    PREFIX = _GUTTER + 2 + 5  # 21
+
+    out = []
+    out.append(' ' * PREFIX + '  ' + col_label_str)
+
+    hdr = ' ' * PREFIX
+    for r in REGS:
+        hdr += f'  {r:>4}'
+    if best_fn:
+        hdr += '   Best gadget (strict/clean/with return first, may be trimmed)'
+    out.append(hdr)
+
+    sep = ' ' * PREFIX + '  ----' * len(REGS)
+    if best_fn:
+        sep += '   ' + '-' * 80
+    out.append(sep)
+
+    mid = len(REGS) // 2
+    for i, row_reg in enumerate(REGS):
+        gutter = f'  {row_label:<{_GUTTER - 2}}' if i == mid else ' ' * _GUTTER
+        cells = ''
+        best_n, best_src = 0, None
+        for col_reg in REGS:
+            if skip_same and col_reg == row_reg:
+                cells += '  ----'
+                continue
+            n = count_fn(row_reg, col_reg)
+            cells += f'  {n:>4}'
+            if best_fn and n > best_n:
+                best_n, best_src = n, col_reg
+        best_cell = ''
+        if best_fn and best_src:
+            ex = best_fn(row_reg, best_src)
+            if ex:
+                best_cell = f'   [{best_src}] {ex[:best_w]}'
+        out.append(f'{gutter}  {row_reg:>5}{cells}{best_cell}')
+    return out
+
+
+def _imm_has_badchar(asm: str, badchars: bytes) -> bool:
+    """Check if any immediate hex value embedded in ASM contains a bad byte."""
+    for m in _re_imm.finditer(asm):
+        val = int(m.group(0), 16)
+        try:
+            val_bytes = val.to_bytes(4, 'little')
+        except OverflowError:
+            continue
+        if any(b in badchars for b in val_bytes):
+            return True
+    return False
+
+
+def _best_str(gadgets, badchars, patterns, w=75):
+    """Return 'addr  asm' string for first clean, non-destructive hit, or None."""
+    for pat in patterns:
+        hits = _hit(gadgets, pat, badchars)
+        if hits:
+            g = hits[0]
+            grade, _ = _grade_asm(g.asm)
+            if grade != 'PROBLEMATIC' and not _imm_has_badchar(g.asm, badchars):
+                return f'{g.addr_str}  {g.asm}'
+    return None
+
+
+# ── Section builders ──────────────────────────────────────────────────────────
+
+def _section_overview(gadgets, badchars, files):
+    lines = []
     if files:
-        names = [_os.path.basename(f) for f in files]
-        file_str = ', '.join(names)
-        overview_lines.append(f"  Gadget files:          {file_str}")
-    overview_lines.append(f"  Total gadgets loaded:  {len(gadgets):,}")
-    overview_lines.append(f"  Bad chars:             {', '.join(hex(b) for b in badchars)}")
-    overview_lines.append(f"  Clean gadgets:         {sum(1 for g in gadgets if not g.has_badchar(badchars)):,}")
-    sections.append(("Overview", "info", overview_lines))
-
-    # ── Shared matrix builder ────────────────────────────────────────────────
-    GUTTER  = 14   # left margin for the row-axis label
-
-    def _best_gadget(patterns):
-        """Try patterns in order, return first hit's address + asm."""
-        for pat in patterns:
-            hits = _hit(gadgets, pat, badchars)
-            if hits:
-                g = hits[0]
-                return f"{g.addr_str}  {g.asm}"
-        return None
-
-    def make_matrix(row_label, col_label_str, count_fn, best_fn=None,
-                    skip_same=True, best_w=80):
-        """Build a labelled matrix with count columns and optional best-gadget column."""
-        PREFIX = GUTTER + 2 + 5   # = 21
-
-        out = []
-
-        # Column axis label
-        out.append(" " * PREFIX + "  " + col_label_str)
-
-        # Register header
-        hdr = " " * PREFIX
-        for r in REGS:
-            hdr += f"  {r:>4}"
-        if best_fn:
-            hdr += "   Best gadget (strict/clean/with return first, may be trimmed)"
-        out.append(hdr)
-
-        # Separator
-        sep = " " * PREFIX
-        for _ in REGS:
-            sep += "  ----"
-        if best_fn:
-            sep += "   " + "-" * min(best_w, 80)
-        out.append(sep)
-
-        # Data rows
-        mid = len(REGS) // 2
-        for i, row_reg in enumerate(REGS):
-            if i == mid:
-                gutter = f"  {row_label:<{GUTTER - 2}}"
-            else:
-                gutter = " " * GUTTER
-
-            cells = ""
-            best_cell = ""
-            best_n = 0
-            best_src = None
-
-            for col_reg in REGS:
-                if skip_same and col_reg == row_reg:
-                    cells += "  ----"
-                    continue
-                n = count_fn(row_reg, col_reg)
-                cells += f"  {n:>4}"
-                # Track highest-count cell for best gadget lookup
-                if best_fn and n > best_n:
-                    best_n = n
-                    best_src = col_reg
-
-            if best_fn and best_src:
-                ex = best_fn(row_reg, best_src)
-                if ex:
-                    best_cell = f"   [{best_src}] {ex[:75]}"
-
-            out.append(f"{gutter}  {row_reg:>5}{cells}{best_cell}")
-        return out
+        import os
+        names = ', '.join(os.path.basename(f) for f in files)
+        lines.append(f'  Gadget files:          {names}')
+    lines.append(f'  Total gadgets loaded:  {len(gadgets):,}')
+    lines.append(f'  Bad chars:             {", ".join(hex(b) for b in badchars)}')
+    lines.append(f'  Clean gadgets:         {sum(1 for g in gadgets if not g.has_badchar(badchars)):,}')
+    return ('Overview', 'info', lines)
 
 
+def _section_eax_hub(gadgets, badchars):
+    other = [r for r in REGS if r != 'eax']
+    lines = [
+        '    EAX is the primary relay register in most ROP chains.',
+        '    Strict (clean ; ret) shown first where available.',
+        '',
+        f"    {'Route':<18}  {'Gadgets':>7}   Best gadget (strict/clean/with return first, may be trimmed)",
+        f"    {'-'*18}  {'-'*7}   {'-'*60}",
+    ]
+    for reg in other:
+        def _count(src, dst):
+            return (len(_hit(gadgets, rf'mov\s+{dst},\s*{src}.*ret', badchars)) +
+                    len(_hit(gadgets, rf'push\s+{src}.*pop\s+{dst}.*ret', badchars)) +
+                    len(_hit(gadgets, rf'xchg\s+({dst},\s*{src}|{src},\s*{dst}).*ret', badchars)))
+
+        def _best(src, dst):
+            cands = _copy_candidates(gadgets, badchars, src, dst, n=1)
+            if cands:
+                g = cands[0][0]
+                return f'{g.addr_str}  {g.asm[:75]}'
+            return None
+
+        n_to = _count(reg, 'eax')
+        n_fr = _count('eax', reg)
+        b_to = _best(reg, 'eax') or 'NOT FOUND'
+        b_fr = _best('eax', reg) or 'NOT FOUND'
+        lines.append(f"    {f'{reg} -> eax':<18}  {n_to:>7}   {b_to}")
+        lines.append(f"    {f'eax -> {reg}':<18}  {n_fr:>7}   {b_fr}")
+        lines.append('')
+    return ('EAX Hub Map  (routes to and from EAX)', 'info', lines)
 
 
-
-
-
-    # ── 7. EAX Hub Map ───────────────────────────────────────────────────────
-    OTHER_REGS = [r for r in REGS if r != 'eax']
-    eax_lines = []
-    eax_lines.append("    EAX is the primary relay register in most ROP chains.")
-    eax_lines.append("    Strict (clean ; ret) shown first where available.")
-    eax_lines.append("")
-    eax_lines.append(f"    {'Route':<18}  {'Gadgets':>7}   Best gadget (strict/clean/with return first, may be trimmed)")
-    eax_lines.append(f"    {'-'*18}  {'-'*7}   {'-'*60}")
-
-    def _eax_best(src, dst):
-        for pat in [
-            rf'^mov\s+{dst},\s*{src}\s*;\s*ret',
-            rf'^push\s+{src}\s*;\s*pop\s+{dst}\s*;\s*ret',
-            rf'mov\s+{dst},\s*{src}.*ret',
-            rf'push\s+{src}.*pop\s+{dst}.*ret',
-            rf'xchg\s+({dst},\s*{src}|{src},\s*{dst}).*ret',
-        ]:
-            hits = _hit(gadgets, pat, badchars)
-            if hits:
-                g = hits[0]
-                return f"{g.addr_str}  {g.asm[:75]}"
-        return None
-
-    for reg in OTHER_REGS:
-        hits_to = (_hit(gadgets, rf'mov\s+eax,\s*{reg}.*ret', badchars) +
-                   _hit(gadgets, rf'push\s+{reg}.*pop\s+eax.*ret', badchars) +
-                   _hit(gadgets, rf'xchg\s+(eax,\s*{reg}|{reg},\s*eax).*ret', badchars))
-        hits_fr = (_hit(gadgets, rf'mov\s+{reg},\s*eax.*ret', badchars) +
-                   _hit(gadgets, rf'push\s+eax.*pop\s+{reg}.*ret', badchars) +
-                   _hit(gadgets, rf'xchg\s+(eax,\s*{reg}|{reg},\s*eax).*ret', badchars))
-        best_to = _eax_best(reg, 'eax')
-        best_fr = _eax_best('eax', reg)
-        route_to = f"{reg} -> eax"
-        route_fr = f"eax -> {reg}"
-        eax_lines.append(f"    {route_to:<18}  {len(hits_to):>7}   {best_to or 'NOT FOUND'}")
-        eax_lines.append(f"    {route_fr:<18}  {len(hits_fr):>7}   {best_fr or 'NOT FOUND'}")
-        eax_lines.append("")
-
-    sections.append(("EAX Hub Map  (routes to and from EAX)", "info", eax_lines))
-    # ── 8. Register Copy Path Analysis ───────────────────────────────────────
-    path_lines = []
-    path_lines.append("    Checking all 2-hop register copy paths via relay...")
-    path_lines.append("")
-
+def _section_path_analysis(gadgets, badchars):
     # Build direct route table
     direct = {}
     for dst in REGS:
         for src in REGS:
             if src == dst: continue
-            mov  = _hit(gadgets, rf'mov\s+{dst},\s*{src}.*ret', badchars)
-            pp   = _hit(gadgets, rf'push\s+{src}.*pop\s+{dst}.*ret', badchars)
-            xchg = _hit(gadgets, rf'xchg\s+({dst},\s*{src}|{src},\s*{dst}).*ret', badchars)
-            if mov or pp or xchg:
-                direct[(src, dst)] = len(mov) + len(pp) + len(xchg)
+            if (_hit(gadgets, rf'mov\s+{dst},\s*{src}.*ret', badchars) or
+                    _hit(gadgets, rf'push\s+{src}.*pop\s+{dst}.*ret', badchars) or
+                    _hit(gadgets, rf'xchg\s+({dst},\s*{src}|{src},\s*{dst}).*ret', badchars)):
+                direct[(src, dst)] = True
 
-    # Find gaps and two-hop solutions
+    # Find gaps
     gaps = []
     for dst in REGS:
         for src in REGS:
-            if src == dst: continue
-            if (src, dst) in direct: continue
+            if src == dst or (src, dst) in direct: continue
             relays = [r for r in REGS if r not in (src, dst)
                       and (src, r) in direct and (r, dst) in direct]
             gaps.append((src, dst, relays))
@@ -184,207 +262,292 @@ def run_analysis(gadgets: List[Gadget], badchars: bytes, files: list = None) -> 
     no_path  = [(s, d) for s, d, r in gaps if not r]
     has_path = [(s, d, r) for s, d, r in gaps if r]
 
-    def _best_for_pair(src, dst):
-        for pat in [
-            rf'^mov\s+{dst},\s*{src}\s*;\s*ret',
-            rf'^push\s+{src}\s*;\s*pop\s+{dst}\s*;\s*ret',
-            rf'mov\s+{dst},\s*{src}.*ret',
-            rf'push\s+{src}.*pop\s+{dst}.*ret',
-            rf'xchg\s+({dst},\s*{src}|{src},\s*{dst}).*ret',
-        ]:
-            hits = _hit(gadgets, pat, badchars)
-            if hits:
-                g = hits[0]
-                return f"{g.addr_str}  {g.asm[:75]}"
-        return None
+    lines = [
+        '    Multiple-Hop paths available for missing direct routes:',
+        '    Grade: [GOOD] all legs clean   [CAUTION] side effects   [PROBLEMATIC] likely AV',
+        '',
+    ]
 
     if has_path:
-        path_lines.append("    Multiple-Hop paths available for missing direct routes:")
-        path_lines.append("")
+        ORDER = {'GOOD': 0, 'CAUTION': 1, 'PROBLEMATIC': 2}
+        graded = []
         for src, dst, relays in sorted(has_path):
-            relay_str = ', '.join(relays)
-            path_lines.append(f"      {src} -> {dst}   via  {relay_str}")
             for relay in relays:
-                ex1 = _best_for_pair(src, relay)
-                ex2 = _best_for_pair(relay, dst)
-                path_lines.append(f"        [{src}->{relay}]  {ex1 or 'NOT FOUND'}")
-                path_lines.append(f"        [{relay}->{dst}]  {ex2 or 'NOT FOUND'}")
-            path_lines.append("")
+                leg1 = _copy_candidates(gadgets, badchars, src, relay)
+                leg2 = _copy_candidates(gadgets, badchars, relay, dst)
+                if not leg1 or not leg2: continue
+                pg = _path_grade([leg1, leg2])
+                graded.append((pg, src, dst, relay, leg1, leg2))
+
+        graded.sort(key=lambda x: (ORDER[x[0]], x[1], x[2]))
+
+        # Keep best-graded relay per (src, dst) pair
+        best_per_pair = {}
+        for entry in graded:
+            key = (entry[1], entry[2])
+            if key not in best_per_pair or ORDER[entry[0]] < ORDER[best_per_pair[key][0]]:
+                best_per_pair[key] = entry
+
+        for key in sorted(best_per_pair):
+            pg, src, dst, relay, leg1, leg2 = best_per_pair[key]
+            lines.append(f'  [{pg:<11}]  {src} -> {dst}   via  {relay}')
+            for label, cands in [(f'{src}->{relay}', leg1), (f'{relay}->{dst}', leg2)]:
+                _render_candidates(cands, label, 6, lines, asm_w=70)
+            lines.append('')
+
     if no_path:
-        path_lines.append("    No path found (direct or 2-hop) for:")
+        lines.append('    No path found (direct or 2-hop) for:')
         for src, dst in sorted(no_path):
-            path_lines.append(f"      {src} -> {dst}   (consider memory write/read relay)")
+            lines.append(f'      {src} -> {dst}   (consider memory write/read relay)')
 
-    sections.append(("Register Copy Path Analysis", "info", path_lines))
+    return ('Register Copy Path Analysis', 'info', lines)
 
-    # ── 2. MOV copy matrix ───────────────────────────────────────────────────
-    mov_missing = []
-    def mov_count(dst, src):
-        hits = _hit(gadgets, rf'mov\s+{dst},\s*{src}.*ret', badchars)
-        if not hits: mov_missing.append((src, dst))
-        return len(hits)
 
-    def mov_best(dst, src):
-        return _best_gadget([
-            rf'^mov\s+{dst},\s*{src}\s*;\s*ret',        # strict
-            rf'mov\s+{dst},\s*{src}.*ret',               # loose
+def _section_memwrite_map(gadgets, badchars):
+    lines = [
+        '  How to read:  REG (ptr) = register holding destination address',
+        '                SRC       = register whose value is written to memory',
+        '  Only clean, non-destructive gadgets shown.',
+        '',
+    ]
+    for ptr in REGS:
+        ptr_entries = []
+        for src in REGS:
+            if src == ptr: continue
+            cands = _best_candidates(gadgets, badchars, [
+                rf'^mov\s+(dword\s*)?\[{ptr}\],\s*{src}\s*;\s*ret',
+                rf'^mov\s+(dword\s*)?\[{ptr}[+-][^\]]+\],\s*{src}\s*;\s*ret',
+                rf'mov\s+(dword\s*)?\[{ptr}[^\]]*\],\s*{src}.*ret',
+            ])
+            if cands:
+                ptr_entries.append((src, cands))
+        if not ptr_entries:
+            continue
+        lines.append(f'  [{ptr}] as pointer:')
+        lines.append(f"    {'SRC':<6}  {'Grade':<11}  Best gadget")
+        lines.append(f"    {'-'*6}  {'-'*11}  {'-'*60}")
+        for src, cands in ptr_entries:
+            for i, (g, grade, note) in enumerate(cands):
+                if i == 1 and cands[0][1] == 'GOOD':
+                    break
+                src_lbl = src if i == 0 else ''
+                flag = f'  !! {note}' if grade != 'GOOD' else ''
+                lines.append(f'    {src_lbl:<6}  [{grade:<9}]  {g.addr_str}  {g.asm[:65]}{flag}')
+        lines.append('')
+    return ('Memory Write Map  (reg -> [ptr])', 'info', lines)
+
+
+def _section_memload_map(gadgets, badchars):
+    lines = [
+        '  How to read:  DST = register receiving the loaded value',
+        '                PTR = register holding the source memory address',
+        '  Only clean, non-destructive gadgets shown.',
+        '  Second candidate shown only if first is flagged.',
+        '',
+    ]
+    for dst in REGS:
+        dst_entries = []
+        for ptr in REGS:
+            if ptr == dst: continue
+            cands = _best_candidates(gadgets, badchars, [
+                rf'^mov\s+{dst},\s*(dword\s*)?\[{ptr}\]\s*;\s*ret',
+                rf'^mov\s+{dst},\s*(dword\s*)?\[{ptr}[+-][^\]]+\]\s*;\s*ret',
+                rf'mov\s+{dst},\s*(dword\s*)?\[{ptr}[^\]]*\].*ret',
+            ])
+            if cands:
+                dst_entries.append((ptr, cands))
+        if not dst_entries:
+            continue
+        lines.append(f'  [{dst}] as destination:')
+        lines.append(f"    {'PTR':<6}  {'Grade':<11}  Best gadget")
+        lines.append(f"    {'-'*6}  {'-'*11}  {'-'*60}")
+        for ptr, cands in dst_entries:
+            for i, (g, grade, note) in enumerate(cands):
+                if i == 1 and cands[0][1] == 'GOOD':
+                    break
+                ptr_lbl = ptr if i == 0 else ''
+                flag = f'  !! {note}' if grade != 'GOOD' else ''
+                lines.append(f'    {ptr_lbl:<6}  [{grade:<9}]  {g.addr_str}  {g.asm[:65]}{flag}')
+        lines.append('')
+    return ('Memory Load Map  ([ptr] -> reg)', 'info', lines)
+
+
+def _section_mov_matrix(gadgets, badchars):
+    missing = []
+
+    def count(dst, src):
+        h = _hit(gadgets, rf'mov\s+{dst},\s*{src}.*ret', badchars)
+        if not h: missing.append((src, dst))
+        return len(h)
+
+    def best(dst, src):
+        return _best_str(gadgets, badchars, [
+            rf'^mov\s+{dst},\s*{src}\s*;\s*ret',
+            rf'mov\s+{dst},\s*{src}.*ret',
         ])
-    mov_lines = make_matrix("DST (row)", "SRC (columns) ->", mov_count)
-    mov_lines.insert(0, "  How to read:  row = destination register,  column = source register")
-    mov_lines.insert(1, "  A value of 4 means 4 gadgets exist for  mov ROW, COL")
-    mov_lines.insert(2, "")
-    sections.append(("MOV Copy Matrix  (mov DST, SRC)", "info", mov_lines))
-    # ── 3. Push/pop relay matrix ─────────────────────────────────────────────
-    pp_missing = []
-    def pp_count(dst, src):
-        hits = _hit(gadgets, rf'push\s+{src}.*pop\s+{dst}.*ret', badchars)
-        if not hits: pp_missing.append((src, dst))
-        return len(hits)
 
-    def pp_best(dst, src):
-        return _best_gadget([
-            rf'^push\s+{src}\s*;\s*pop\s+{dst}\s*;\s*ret',   # strict
-            rf'push\s+{src}.*pop\s+{dst}.*ret',                 # loose
+    mat = _make_matrix('DST (row)', 'SRC (columns) ->', count, best_fn=best)
+    mat.insert(0, '  How to read:  row = destination register,  column = source register')
+    mat.insert(1, '  A value of 4 means 4 gadgets exist for  mov ROW, COL')
+    mat.insert(2, '')
+    return ('MOV Copy Matrix  (mov DST, SRC)', 'info', mat)
+
+
+def _section_pp_matrix(gadgets, badchars):
+    missing = []
+
+    def count(dst, src):
+        h = _hit(gadgets, rf'push\s+{src}.*pop\s+{dst}.*ret', badchars)
+        if not h: missing.append((src, dst))
+        return len(h)
+
+    def best(dst, src):
+        return _best_str(gadgets, badchars, [
+            rf'^push\s+{src}\s*;\s*pop\s+{dst}\s*;\s*ret',
+            rf'push\s+{src}.*pop\s+{dst}.*ret',
         ])
-    pp_lines = make_matrix("DST (row)", "SRC (columns) ->", pp_count)
-    pp_lines.insert(0, "  How to read:  row = destination,  column = source")
-    pp_lines.insert(1, "  A value of 7 means 7 gadgets exist for  push COL ; ... ; pop ROW")
-    pp_lines.insert(2, "")
-    sections.append(("Push/Pop Relay Matrix  (push SRC ... pop DST)", "info", pp_lines))
-    # ── 4. XCHG matrix ───────────────────────────────────────────────────────
-    def xchg_count(r1, r2):
+
+    mat = _make_matrix('DST (row)', 'SRC (columns) ->', count, best_fn=best)
+    mat.insert(0, '  How to read:  row = destination,  column = source')
+    mat.insert(1, '  A value of 7 means 7 gadgets exist for  push COL ; ... ; pop ROW')
+    mat.insert(2, '')
+    return ('Push/Pop Relay Matrix  (push SRC ... pop DST)', 'info', mat)
+
+
+def _section_xchg_matrix(gadgets, badchars):
+    def count(r1, r2):
         if r2 >= r1: return 0
-        hits = _hit(gadgets, rf'xchg\s+({r1},\s*{r2}|{r2},\s*{r1}).*ret', badchars)
-        return len(hits)
+        return len(_hit(gadgets, rf'xchg\s+({r1},\s*{r2}|{r2},\s*{r1}).*ret', badchars))
 
-    def xchg_best(r1, r2):
-        if r2 >= r1: return None
-        return _best_gadget([
-            rf'xchg\s+({r1},\s*{r2}|{r2},\s*{r1})\s*;\s*ret',
-            rf'xchg\s+({r1},\s*{r2}|{r2},\s*{r1}).*ret',
-        ])
-    xchg_lines = make_matrix("REG (row)", "REG (columns) ->", xchg_count)
-    xchg_lines.insert(0, "  How to read:  lower-left triangle only  (symmetric operation)")
-    xchg_lines.insert(1, "  A value of 2 means 2 gadgets swap ROW and COL  (both registers change)")
-    xchg_lines.insert(2, "")
-    sections.append(("XCHG Matrix  (destructive swap)", "info", xchg_lines))
-    # ── 5. Memory write matrix ───────────────────────────────────────────────
-    def mw_count(ptr, src):
-        hits = _hit(gadgets,
-                    rf'mov\s+(dword\s*)?\[{ptr}[^\]]*\],\s*{src}.*ret', badchars)
-        return len(hits)
+    mat = _make_matrix('REG (row)', 'REG (columns) ->', count)
+    mat.insert(0, '  How to read:  lower-left triangle only  (symmetric operation)')
+    mat.insert(1, '  A value of 2 means 2 gadgets swap ROW and COL  (both registers change)')
+    mat.insert(2, '')
+    return ('XCHG Matrix  (destructive swap)', 'info', mat)
 
-    def mw_best(ptr, src):
-        return _best_gadget([
+
+def _section_memwrite_matrix(gadgets, badchars):
+    def count(ptr, src):
+        return len(_hit(gadgets, rf'mov\s+(dword\s*)?\[{ptr}[^\]]*\],\s*{src}.*ret', badchars))
+
+    def best(ptr, src):
+        return _best_str(gadgets, badchars, [
             rf'^mov\s+(dword\s*)?\[{ptr}\],\s*{src}\s*;\s*ret',
             rf'mov\s+(dword\s*)?\[{ptr}[^\]]*\],\s*{src}.*ret',
         ])
-    mw_lines = make_matrix("PTR (row)", "SRC (columns) ->", mw_count)
-    mw_lines.insert(0, "  How to read:  row = pointer register holding dest address,  column = source value")
-    mw_lines.insert(1, "  A value of 60 means 60 gadgets exist for  mov [ROW], COL")
-    mw_lines.insert(2, "")
-    sections.append(("Memory Write Matrix  (mov [PTR], SRC)", "info", mw_lines))
-    # ── 6. Memory read matrix ────────────────────────────────────────────────
-    def mr_count(dst, ptr):
-        hits = _hit(gadgets,
-                    rf'mov\s+{dst},\s*(dword\s*)?\[{ptr}[^\]]*\].*ret', badchars)
-        return len(hits)
 
-    def mr_best(dst, ptr):
-        return _best_gadget([
+    mat = _make_matrix('PTR (row)', 'SRC (columns) ->', count, best_fn=best)
+    mat.insert(0, '  How to read:  row = pointer register holding dest address,  column = source value')
+    mat.insert(1, '  A value of 60 means 60 gadgets exist for  mov [ROW], COL')
+    mat.insert(2, '')
+    return ('Memory Write Matrix  (mov [PTR], SRC)', 'info', mat)
+
+
+def _section_memread_matrix(gadgets, badchars):
+    def count(dst, ptr):
+        return len(_hit(gadgets, rf'mov\s+{dst},\s*(dword\s*)?\[{ptr}[^\]]*\].*ret', badchars))
+
+    def best(dst, ptr):
+        return _best_str(gadgets, badchars, [
             rf'^mov\s+{dst},\s*(dword\s*)?\[{ptr}\]\s*;\s*ret',
             rf'mov\s+{dst},\s*(dword\s*)?\[{ptr}[^\]]*\].*ret',
         ])
-    mr_lines = make_matrix("DST (row)", "PTR (columns) ->", mr_count)
-    mr_lines.insert(0, "  How to read:  row = destination register,  column = pointer register")
-    mr_lines.insert(1, "  A value of 69 means 69 gadgets exist for  mov ROW, [COL]")
-    mr_lines.insert(2, "")
-    sections.append(("Memory Read Matrix  (mov DST, [PTR])", "info", mr_lines))
 
-    # ── Add / Sub ─────────────────────────────────────────────────────────────
+    mat = _make_matrix('DST (row)', 'PTR (columns) ->', count, best_fn=best)
+    mat.insert(0, '  How to read:  row = destination register,  column = pointer register')
+    mat.insert(1, '  A value of 69 means 69 gadgets exist for  mov ROW, [COL]')
+    mat.insert(2, '')
+    return ('Memory Read Matrix  (mov DST, [PTR])', 'info', mat)
+
+
+def _section_addsub_matrix(gadgets, badchars):
     def add_count(dst, src):
         return len(_hit(gadgets, rf'add\s+{dst},\s*{src}.*ret', badchars))
 
     def sub_count(dst, src):
         return len(_hit(gadgets, rf'sub\s+{dst},\s*{src}.*ret', badchars))
 
-    add_lines = []
-    add_lines.append("  How to read:  row = destination register,  column = source register")
-    add_lines.append("  ADD and SUB shown as separate matrices below")
-    add_lines.append("")
-    add_lines.append("  ADD  (add DST, SRC)")
-    add_lines.append("")
-    for l in make_matrix("DST (row)", "SRC (columns) ->", add_count):
-        add_lines.append(l)
-    add_lines.append("")
-    add_lines.append("  SUB  (sub DST, SRC)")
-    add_lines.append("")
-    for l in make_matrix("DST (row)", "SRC (columns) ->", sub_count):
-        add_lines.append(l)
+    lines = [
+        '  How to read:  row = destination register,  column = source register',
+        '  ADD and SUB shown as separate matrices below',
+        '',
+        '  ADD  (add DST, SRC)',
+        '',
+    ]
+    for l in _make_matrix('DST (row)', 'SRC (columns) ->', add_count):
+        lines.append(l)
+    lines.append('')
+    lines.append('  SUB  (sub DST, SRC)')
+    lines.append('')
+    for l in _make_matrix('DST (row)', 'SRC (columns) ->', sub_count):
+        lines.append(l)
+    return ('Add / Sub Matrix  (register to register)', 'info', lines)
 
-    sections.append(("Add / Sub Matrix  (register to register)", "info", add_lines))
 
-    # ── Inc / Dec / Neg ──────────────────────────────────────────────────────
-    incdec_lines = []
-    incdec_lines.append("  How to read:  count of clean gadgets for each operation on that register")
-    incdec_lines.append("")
-    incdec_lines.append(f"    {'Reg':<6}  {'inc':>6}  {'dec':>6}  {'neg':>6}")
-    incdec_lines.append(f"    {'-'*6}  {'------':>6}  {'------':>6}  {'------':>6}")
+def _section_incdecneg(gadgets, badchars):
+    lines = [
+        '  How to read:  count of clean gadgets for each operation on that register',
+        '',
+        f"    {'Reg':<6}  {'inc':>6}  {'dec':>6}  {'neg':>6}",
+        f"    {'-'*6}  {'------':>6}  {'------':>6}  {'------':>6}",
+    ]
     for reg in REGS:
         inc_n = len(_hit(gadgets, rf'inc\s+{reg}.*ret', badchars))
         dec_n = len(_hit(gadgets, rf'dec\s+{reg}.*ret', badchars))
         neg_n = len(_hit(gadgets, rf'neg\s+{reg}.*ret', badchars))
-        incdec_lines.append(f"    {reg:<6}  {inc_n:>6}  {dec_n:>6}  {neg_n:>6}")
-    sections.append(("Inc / Dec / Neg  (per register counts)", "info", incdec_lines))
+        lines.append(f'    {reg:<6}  {inc_n:>6}  {dec_n:>6}  {neg_n:>6}')
+    return ('Inc / Dec / Neg  (per register counts)', 'info', lines)
 
-    # ── 9. Capture ESP ───────────────────────────────────────────────────────
-    esp_lines = []
-    esp_found = []
+
+def _section_capture_esp(gadgets, badchars):
+    lines = []
     for dst in REGS:
         hits = _hit(gadgets,
                     rf'(mov\s+{dst},\s*esp|lea\s+{dst},\s*\[esp|push\s+esp.*pop\s+{dst}).*ret',
                     badchars)
         if hits:
-            esp_found.append(dst)
-            esp_lines.append(f"    {dst:>5}  {len(hits):>4} gadgets   {hits[0].asm}")
-    if not esp_lines:
-        esp_lines.append("    NOT FOUND in any register")
-    sections.append(("Capture ESP  (get stack address into register)", "info", esp_lines))
+            lines.append(f'    {dst:>5}  {len(hits):>4} gadgets   {hits[0].asm}')
+    if not lines:
+        lines.append('    NOT FOUND in any register')
+    return ('Capture ESP  (get stack address into register)', 'info', lines)
 
-    # ── 10. Zero register ────────────────────────────────────────────────────
-    zero_lines = []
-    zero_missing = []
+
+def _section_zero_register(gadgets, badchars):
+    lines = []
+    missing = []
     for reg in REGS:
-        hits = _hit(gadgets,
-                    rf'(xor\s+{reg},\s*{reg}|sub\s+{reg},\s*{reg}).*ret', badchars)
+        hits = _hit(gadgets, rf'(xor\s+{reg},\s*{reg}|sub\s+{reg},\s*{reg}).*ret', badchars)
         if hits:
-            zero_lines.append(f"    {reg:>5}  {len(hits):>4} gadgets   {hits[0].asm}")
+            lines.append(f'    {reg:>5}  {len(hits):>4} gadgets   {hits[0].asm}')
         else:
-            zero_missing.append(reg)
-            zero_lines.append(f"    {reg:>5}     0 gadgets   NOT FOUND")
+            missing.append(reg)
+            lines.append(f'    {reg:>5}     0 gadgets   NOT FOUND')
     cdq = _hit(gadgets, r'^cdq\s*;?\s*ret', badchars)
     if cdq:
-        zero_lines.append(f"    {'edx':>5}  {len(cdq):>4} via cdq   {cdq[0].asm}")
-        if 'edx' in zero_missing:
-            zero_missing.remove('edx')
-    sections.append(("Zero Register", "info", zero_lines))
-    # ── 11. Stack pivot ───────────────────────────────────────────────────────
-    pivot_lines = []
+        lines.append(f"    {'edx':>5}  {len(cdq):>4} via cdq   {cdq[0].asm}")
+        if 'edx' in missing:
+            missing.remove('edx')
+    return ('Zero Register', 'info', lines)
+
+
+def _section_stack_pivot(gadgets, badchars):
+    lines = []
     for reg in REGS:
-        if reg == 'ebp':
-            continue
+        if reg == 'ebp': continue
         hits = _hit(gadgets,
                     rf'(xchg\s+({reg},\s*esp|esp,\s*{reg})|mov\s+esp,\s*{reg}).*ret',
                     badchars)
         if hits:
-            pivot_lines.append(f"    via {reg:<5}  {len(hits):>4} gadgets   {hits[0].asm}")
+            lines.append(f'    via {reg:<5}  {len(hits):>4} gadgets   {hits[0].asm}')
     leave = _hit(gadgets, r'(leave|mov\s+esp,\s*ebp).*ret', badchars)
     if leave:
-        pivot_lines.append(f"    via {'leave':<5}  {len(leave):>4} gadgets   {leave[0].asm}")
-    if not pivot_lines:
-        pivot_lines.append("    NOT FOUND")
-    sections.append(("Stack Pivot", "info", pivot_lines))
-    # ── 12. Key single instructions ───────────────────────────────────────────
+        lines.append(f"    via {'leave':<5}  {len(leave):>4} gadgets   {leave[0].asm}")
+    if not lines:
+        lines.append('    NOT FOUND')
+    return ('Stack Pivot', 'info', lines)
+
+
+def _section_key_singles(gadgets, badchars):
     singles = [
         ('cld',    r'^cld\s*;?\s*ret',    'REQUIRED before stosd/lodsd'),
         ('cdq',    r'^cdq\s*;?\s*ret',    'null-free EDX zero'),
@@ -395,15 +558,40 @@ def run_analysis(gadgets: List[Gadget], badchars: bytes, files: list = None) -> 
         ('leave',  r'^leave\s*;?\s*ret',  'mov esp,ebp; pop ebp'),
         ('nop',    r'^nop\s*;?\s*ret',    'padding/alignment'),
     ]
-    single_lines = []
-    single_missing = []
+    lines = []
     for name, pat, desc in singles:
         hits = _hit(gadgets, pat, badchars)
         if hits:
-            single_lines.append(f"    {name:<8}  {len(hits):>4} gadgets   {hits[0].asm}")
+            lines.append(f'    {name:<8}  {len(hits):>4} gadgets   {hits[0].asm}')
         else:
-            single_lines.append(f"    {name:<8}     0 gadgets   NOT FOUND  ({desc})")
-            single_missing.append(name)
-    sections.append(("Key Single Instructions", "info", single_lines))
+            lines.append(f'    {name:<8}     0 gadgets   NOT FOUND  ({desc})')
+    return ('Key Single Instructions', 'info', lines)
 
-    return sections
+
+# ── Orchestrator ──────────────────────────────────────────────────────────────
+
+def run_analysis(gadgets: List[Gadget], badchars: bytes,
+                 files: list = None) -> List[Tuple[str, str, List[str]]]:
+    """
+    Run all analysis sections and return a list of (title, status, lines).
+    status is always 'info' — users differentiate pass/fail themselves.
+    """
+    g, b = gadgets, badchars
+    return [
+        _section_overview(g, b, files),
+        _section_eax_hub(g, b),
+        _section_path_analysis(g, b),
+        _section_memwrite_map(g, b),
+        _section_memload_map(g, b),
+        _section_mov_matrix(g, b),
+        _section_pp_matrix(g, b),
+        _section_xchg_matrix(g, b),
+        _section_memwrite_matrix(g, b),
+        _section_memread_matrix(g, b),
+        _section_addsub_matrix(g, b),
+        _section_incdecneg(g, b),
+        _section_capture_esp(g, b),
+        _section_zero_register(g, b),
+        _section_stack_pivot(g, b),
+        _section_key_singles(g, b),
+    ]

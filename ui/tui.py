@@ -331,7 +331,10 @@ def draw_search_tab(win, state: AppState):
     if not state.search_results:
         if state.search_query:
             safe_addstr(win, y + 1, 4,
-                        f"No gadgets matched '{state.search_query[:w-20]}' -- try broadening or use x for regex",
+                        f"No gadgets matched '{state.search_query[:w-30]}'"
+                        + ("  (looks like regex — press x to search as regex)"
+                           if any(c in state.search_query for c in r'\[]().*+?^$')
+                           else "  -- try broadening your search or use x for regex"),
                         curses.color_pair(C_DIM))
         else:
             # ── Regex quick-start guide ───────────────────────────────────────
@@ -347,18 +350,21 @@ def draw_search_tab(win, state: AppState):
             sh(row, 2, "Plain search  (/  or  n to refine)", CY)
             sh(row, 42, "Matches ASM text or gadget address.", DIM)
             row += 1
-            sh(row, 4, "mov eax",     GD)
-            sh(row, 18, "->  any gadget containing 'mov eax' in the ASM", DIM)
+            sh(row, 4, "mov eax",              GD)
+            sh(row, 18, "->  any gadget containing 'mov eax'", DIM)
             row += 1
-            sh(row, 4, "0x10012f97",  GD)
+            sh(row, 4, "mov eax, dword [ecx]", GD)
+            sh(row, 28, "->  memory deref  (rp++ always includes 'dword')", DIM)
+            row += 1
+            sh(row, 4, "0x10012f97",           GD)
             sh(row, 18, "->  look up a gadget by full address", DIM)
             row += 1
-            sh(row, 4, "10012f",      GD)
+            sh(row, 4, "10012f",               GD)
             sh(row, 18, "->  partial address — returns all gadgets in that range", DIM)
             row += 2
 
-            sh(row, 2, "Regex search  (x)", CY)
-            sh(row, 20, "Pattern language — build precise matches:", DIM)
+            sh(row, 2, "Regex search  — press x", CY)
+            sh(row, 26, "(MUST use x, not /)  Pattern language — build precise matches:", DIM)
             row += 1
 
             entries = [
@@ -367,6 +373,7 @@ def draw_search_tab(win, state: AppState):
                 (r".*",          "anything in between    e.g.  push.*pop  matches push then pop"),
                 (r"e[a-z]{2}",   "any register           e.g.  mov\\s+e[a-z]{2},\\s*eax"),
                 (r"[^]]+",       "anything except ]      e.g.  [eax[^]]*]  matches [eax+offset]"),
+                (r"\[ecx\]",     "literal brackets  e.g.  mov\\s+eax,\\s*dword \\[ecx\\]  (note: literal space before [)"),
                 (r"(a|b)",       "either a or b          e.g.  (mov|lea)\\s+eax"),
                 (r"^mov",        "must start with mov    e.g.  ^mov\\s+eax  (strict = clean)"),
                 (r";.*ret",      "ends with ret          e.g.  ^mov\\s+eax,\\s*esi\\s*;.*ret"),

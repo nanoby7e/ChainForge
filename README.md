@@ -14,9 +14,11 @@ This tool is intended for authorized security research, penetration testing, and
 
 ## Overview
 
-ChainForge reduces the manual effort involved in Windows x86 ROP chain development. It processes rp++ gadget output and provides a searchable, interactive workspace for finding gadgets, understanding what a target DLL can and cannot do, building and validating chains, and exporting them — all in one terminal interface.
+ChainForge reduces the manual effort involved in Windows x86 ROP chain development. It processes rp++ gadget output and gives you a single terminal workspace to answer the questions that come up repeatedly during exploit development: what can this DLL actually do, can I copy this register into that one, what does this address point to, and does my chain have any bad bytes in it.
 
-All searches and analysis are bad-char aware. Gadgets at addresses containing bad bytes are excluded automatically based on your configured constraints.
+The TUI is split into six tabs navigated by number keys. Analysis runs a full capability report on your loaded gadgets. Search lets you query by plain text, regex, or address. Suggest translates plain-language goals into ranked gadget candidates. Chain is an interactive builder that validates, reorders, exports, and saves your work. NullChk verifies addresses against your bad char constraints. The RegEx CheatSheet gives you a browsable reference of pre-built search patterns.
+
+Everything is bad-char aware throughout. Gadgets at addresses containing bad bytes are excluded from all results automatically based on your configured set. This applies equally to search results, analysis section counts, best-gadget examples, and the grading of multi-hop paths — including ASM immediate values that would embed bad bytes into the instruction stream.
 
 ---
 
@@ -93,37 +95,48 @@ Press `?` inside the TUI to open the help menu.
 
 ### [1] Analysis
 
-Full DLL capability scan. Run this first on a new target to understand what is and is not available before building a chain. All counts reflect only gadgets at clean addresses that pass your bad char filter. The overview lists every gadget file loaded, total gadget count, bad chars, and clean gadget count.
+Full DLL capability scan. Run this first on a new target to understand what is and is not available before building a chain. All counts reflect only gadgets at clean addresses that pass your bad char filter. The overview lists every gadget file loaded, total gadget count, bad chars in use, and clean gadget count.
 
-- **EAX Hub Map** — all routes to and from EAX with gadget counts and best examples, since EAX is the primary relay register in most chains
-- **Multiple-Hop Path Analysis** — automatically finds relay routes for missing direct register copies, with best gadget shown per leg
-- **Register copy matrices** — `mov`, push/pop relay, and `xchg` counts for every register pair
-- **Memory read/write matrices** — `mov [PTR], SRC` and `mov DST, [PTR]` for every combination
-- **Add / Sub matrices** — register-to-register arithmetic counts (ADD and SUB shown separately)
-- **Inc / Dec / Neg** — per-register counts for single-register arithmetic
-- **Capture ESP** — which registers can receive the stack pointer
-- **Zero register** — which registers can be zeroed cleanly
-- **Stack pivot** — available pivot gadgets
-- **Key single instructions** — `cld`, `cdq`, `pushad`, `popad`, `stosd`, `lodsd`, `nop`
+Sections are produced in order:
+
+**EAX Hub Map** — maps every route to and from EAX across all loaded modules, with gadget counts and the best example for each direction. EAX is the primary relay register in most x86 ROP chains and this section gives you a quick picture of how reachable it is from any other register before you start planning.
+
+**Multiple-Hop Path Analysis** — for every register pair that has no direct copy route, ChainForge finds the best 2-hop relay through an intermediate register and grades the path. Grades are GOOD (all legs have clean gadgets with no destructive side effects), CAUTION (side effects present — `leave`, `retn N`, mid-gadget memory dereferences), or PROBLEMATIC (likely access violation — `hlt`, `rep movsd`, ESP corruption via dereference, segment register pops, privileged I/O). When the best gadget for a leg is flagged, an alternative is shown. Paths where no viable relay exists are explicitly listed so you know what is simply not available.
+
+**Memory Write Map** — for each pointer register, lists every source register that can be written to memory at that address, with grade and best gadget. Only GOOD and CAUTION gadgets are shown; PROBLEMATIC ones are excluded.
+
+**Memory Load Map** — the reverse: for each destination register, which pointer registers can load a value from memory into it.
+
+**Register copy matrices** — `mov`, push/pop relay, and `xchg` counts for every register pair, with the best available gadget shown per row.
+
+**Memory read/write matrices** — `mov [PTR], SRC` and `mov DST, [PTR]` counts for every combination.
+
+**Add / Sub matrices** — ADD and SUB shown as separate grids with counts per register pair.
+
+**Inc / Dec / Neg** — per-register counts for single-register arithmetic.
+
+**Capture ESP, Zero Register, Stack Pivot, Key Single Instructions** — availability and best examples for each.
 
 ### [2] Search
 
-Plain text and regex gadget search across all loaded files simultaneously. Results are sorted: plain `ret` first, then fewest instructions, then score. Each result shows a bad char indicator, ret type, instruction count, address, ASM, and source module.
+Plain text and regex gadget search across all loaded files simultaneously. Results are sorted: plain `ret` first, then fewest instructions, then score. Each result shows a bad char indicator, ret type, instruction count, address, ASM, and source module. A `>` marker in the left gutter shows the selected row.
 
-- `/` — new plain text search (starts empty)
-- `x` — new regex search (starts empty)
+- `/` — new plain text search
+- `x` — new regex search
 - `n` — refine — pre-fills the last query to edit and re-run
 - `c` — clear results and return to the intro screen
 - `Enter` — add selected gadget to chain
 - `a` — add all current results to chain
 
-Search by address as well as ASM — enter a full address or a partial to find gadgets by location.
+You can search by address as well as ASM text — enter a full address like `0x10012f97` or a partial like `10012f` to find gadgets by location.
 
-The intro screen includes a regex quick-start guide and points to the RegEx CheatSheet tab for pre-built patterns.
+**Important:** rp++ always emits `dword` in memory operands. To search for a dereference use plain search with the exact text (`mov eax, dword [ecx]`) or regex with a literal space before the bracket (`mov\s+eax,\s*dword \[ecx\]`). The `[` must be escaped as `\[` in regex mode.
+
+The intro screen includes a regex quick-start guide. The RegEx CheatSheet tab has pre-built patterns with strict/loose/broad tags.
 
 ### [3] Suggest
 
-Goal-based search. Describe what you want in plain language and ChainForge searches all loaded modules, returning results grouped by category and ranked by quality (strict/clean first).
+Goal-based search. Describe what you want in plain language and ChainForge searches all loaded modules, returning results grouped into strict, loose, and broad tiers so you can start with the cleanest gadgets and fall back as needed.
 
 ```
 copy eax              copy eax to ecx       copy into esi from eax
@@ -132,14 +145,14 @@ push eax              pop ecx               capture esp
 stack pivot           call virtualalloc
 ```
 
-- `/` — new goal (starts empty)
+- `/` — new goal
 - `n` — refine last goal
 - `c` — return to goal browser
 - `Enter` — add selected gadget to chain
 
 ### [4] Chain
 
-Interactive chain builder. Gadgets added from Search or Suggest appear here.
+Interactive chain builder. Gadgets added from Search or Suggest appear here. Every entry shows its address, ASM, comment, and bad char status.
 
 - `a` add by address, `p` add padding, `d` delete, `K`/`J` reorder
 - `v` validate all entries for bad chars
@@ -149,15 +162,42 @@ Interactive chain builder. Gadgets added from Search or Suggest appear here.
 - `S` save to JSON, `O` import from JSON (replace or append)
 - `N` rename chain
 
-On quit, if the chain has unsaved entries, a save prompt appears.
+On quit, if the chain has unsaved entries, a save prompt appears before closing.
 
 ### [5] NullChk
 
-Check any address or value against your bad char constraints. Shows which specific bytes are problematic and supports batch checking.
+Check any address or value against your bad char constraints. Shows which specific byte positions are problematic and supports batch checking of multiple values at once. Bad chars can be updated mid-session with `b`.
 
 ### [6] RegEx CheatSheet
 
-Browsable reference of pre-built regex patterns from `data/cheatsheet.md`, organized by category. Each pattern is tagged `strict`, `loose`, or `broad`. Press `Enter` on any pattern to copy it to the Search tab and run it immediately.
+Browsable reference of pre-built regex patterns from `data/cheatsheet.md`, organized by operation category. Each pattern is tagged `strict` (clean gadget, ret immediately follows), `loose` (side effects allowed), or `broad` (widest match). Press `Enter` on any pattern to copy it directly to the Search tab and run it immediately.
+
+---
+
+## Testing
+
+ChainForge includes a test suite (`test_suite.py`) that validates the tool against your actual gadget files. It runs five layers of checks and writes a self-contained log that can be read in a new context to understand exactly what was tested.
+
+```bash
+python test_suite.py \
+    --files module_a_rop.txt module_b_rop.txt module_c_rop.txt \
+    --badchars 00,09,0a,0b,0c,0d,20 \
+    --sample-pct 25 \
+    --seed 42 \
+    --log test_results.log
+```
+
+**Layer 1 — Random address sample** (default 25% of clean gadgets): verifies sampled gadgets are findable by address search, confirmed clean, not present when searched with dirty-only filtering, findable by ASM fragment, and that deduplication produces no duplicate ASM strings in results.
+
+**Layer 2 — Matrix consistency**: for every cell in the MOV, Push/Pop, XCHG, Memory Write, Memory Read, ADD, and SUB matrices, confirms the count matches a direct standalone search using the same pattern. Also checks that the first result per cell is at a clean address and that filtered counts are always ≤ unfiltered counts.
+
+**Layer 3 — Grading coverage**: runs 50 known ASM strings through `_grade_asm()` covering every branch of the destructive and caution pattern sets, verifies all 10 immediate bad byte detection cases, and confirms the grading function is deterministic.
+
+**Layer 4 — Suggest and NullChk**: 15 goal-based searches verified to return zero dirty gadgets; 15 address classifications verified against expected clean/dirty status; bad byte position accuracy checked.
+
+**Layer 5 — Chain**: entry bad char consistency, `validate()` correctly catches injected bad address, JSON round-trip preserves all entries and metadata, Python export contains all addresses and correct structure.
+
+The `--seed` flag makes sampling reproducible. The log file includes all PASS/FAIL lines, sample counts, and a summary so it is fully self-contained.
 
 ---
 
@@ -166,6 +206,7 @@ Browsable reference of pre-built regex patterns from `data/cheatsheet.md`, organ
 ```
 chainforge/
 ├── chainforge.py          entry point
+├── test_suite.py          validation test suite
 ├── gadgets/               drop rp++ .txt files here for auto-loading
 ├── core/
 │   ├── search.py          gadget search engine
