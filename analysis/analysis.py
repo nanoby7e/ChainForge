@@ -9,8 +9,9 @@ Architecture:
 """
 
 import re
+import struct
 from typing import List, Dict, Tuple, Optional
-from search import Gadget, search_gadgets
+from core.search import Gadget, search_gadgets
 
 # ── Register set ──────────────────────────────────────────────────────────────
 REGS = ['eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp']
@@ -44,10 +45,17 @@ _re_imm = re.compile(r'\b0x[0-9a-fA-F]{4,8}\b')
 
 # ── Pure helper functions ─────────────────────────────────────────────────────
 
+_search_cache: Dict[Tuple[str, bytes], List[Gadget]] = {}
+
 def _hit(gadgets: List[Gadget], pattern: str, badchars: bytes) -> List[Gadget]:
-    """Search gadgets with regex, filtering bad chars."""
-    return search_gadgets(gadgets, pattern, badchars=badchars,
-                          regex_mode=True, max_results=0)
+    """Search gadgets with regex, filtering bad chars. Cached per run_analysis() call."""
+    key = (pattern, badchars)
+    if key in _search_cache:
+        return _search_cache[key]
+    result = search_gadgets(gadgets, pattern, badchars=badchars,
+                            regex_mode=True, max_results=0)
+    _search_cache[key] = result
+    return result
 
 
 def _grade_asm(asm: str) -> Tuple[str, str]:
@@ -568,30 +576,317 @@ def _section_key_singles(gadgets, badchars):
     return ('Key Single Instructions', 'info', lines)
 
 
+# ── Phase 2 section builders ─────────────────────────────────────────────────
+
+def _section_quality_distribution(gadgets, badchars):
+    """Score and grade distribution across clean gadgets."""
+    lines = []
+    clean = [g for g in gadgets if not g.has_badchar(badchars)]
+    total = len(clean)
+    if not total:
+        lines.append('  No clean gadgets to analyse.')
+        return ('Gadget Quality Distribution', 'info', lines)
+
+    buckets = [
+        ('Clean (< 20)',     lambda s: s < 20),
+        ('Moderate (20-39)', lambda s: 20 <= s < 40),
+        ('Heavy (40-59)',    lambda s: 40 <= s < 60),
+        ('Complex (60+)',    lambda s: s >= 60),
+    ]
+    bucket_counts = []
+    for label, test in buckets:
+        c = sum(1 for g in clean if test(g.score))
+        bucket_counts.append((label, c))
+
+    grade_counts = {'GOOD': 0, 'CAUTION': 0, 'PROBLEMATIC': 0}
+    for g in clean:
+        grade, _ = _grade_asm(g.asm)
+        grade_counts[grade] += 1
+
+    bar_w = 40
+    lines.append(f'  Total clean gadgets: {total:,}')
+    lines.append('')
+    lines.append('  Score Distribution  (lower = cleaner gadget):')
+    for label, count in bucket_counts:
+        pct = count / total * 100
+        filled = int(bar_w * count / total)
+        bar = '#' * filled + '-' * (bar_w - filled)
+        lines.append(f'    {label:<22}  [{bar}]  {count:>6}  ({pct:5.1f}%)')
+
+    lines.append('')
+    lines.append('  Grade Distribution  (destructive pattern analysis):')
+    for grade in ('GOOD', 'CAUTION', 'PROBLEMATIC'):
+        count = grade_counts[grade]
+        pct = count / total * 100
+        filled = int(bar_w * count / total)
+        bar = '#' * filled + '-' * (bar_w - filled)
+        lines.append(f'    {grade:<22}  [{bar}]  {count:>6}  ({pct:5.1f}%)')
+
+    return ('Gadget Quality Distribution', 'info', lines)
+
+
+def _section_cross_module(gadgets, badchars):
+    """Per-module capability comparison."""
+    from collections import defaultdict
+    by_module = defaultdict(list)
+    for g in gadgets:
+        by_module[g.module].append(g)
+
+    if len(by_module) < 2:
+        return ('Cross-Module Comparison', 'info',
+                ['  Single module loaded -- comparison requires 2+ files.'])
+
+    lines = []
+    _R = r'e[a-z]{2}'
+    capabilities = [
+        ('MOV copy',   rf'mov\s+{_R},\s*{_R}.*ret'),
+        ('Push/Pop',   rf'push\s+{_R}.*pop\s+{_R}.*ret'),
+        ('XCHG',       rf'xchg\s+({_R},\s*{_R}).*ret'),
+        ('Mem Write',  rf'mov\s+(dword\s*)?\[{_R}[^\]]*\],\s*{_R}.*ret'),
+        ('Mem Read',   rf'mov\s+{_R},\s*(dword\s*)?\[{_R}[^\]]*\].*ret'),
+        ('Pop Reg',    rf'pop\s+{_R}.*ret'),
+        ('Zero Reg',   rf'(xor|sub)\s+({_R}),\s*\2.*ret'),
+        ('Add/Sub',    rf'(add|sub)\s+{_R},\s*(0x|{_R}).*ret'),
+        ('Inc/Dec',    rf'(inc|dec)\s+{_R}.*ret'),
+        ('Stk Pivot',  rf'(xchg|mov)\s+.*esp.*ret'),
+    ]
+
+    mod_names = sorted(by_module.keys())
+    col_w = max(14, min(22, max(len(m) for m in mod_names) + 2))
+
+    lines.append('  Unique clean gadgets per module (deduplicated by ASM):')
+    lines.append('')
+    hdr = f"    {'Capability':<14}"
+    for m in mod_names:
+        hdr += f"  {m[:col_w]:>{col_w}}"
+    lines.append(hdr)
+    sep = f"    {'-'*14}" + (f"  {'-'*col_w}" * len(mod_names))
+    lines.append(sep)
+
+    for cap_name, pattern in capabilities:
+        row = f"    {cap_name:<14}"
+        for m in mod_names:
+            hits = search_gadgets(by_module[m], pattern, badchars=badchars,
+                                  regex_mode=True, max_results=0)
+            row += f"  {len(hits):>{col_w}}"
+        lines.append(row)
+
+    lines.append(sep)
+    row = f"    {'Total Clean':<14}"
+    for m in mod_names:
+        clean = sum(1 for g in by_module[m] if not g.has_badchar(badchars))
+        row += f"  {clean:>{col_w}}"
+    lines.append(row)
+
+    return ('Cross-Module Comparison', 'info', lines)
+
+
+def _section_aslr_awareness(gadgets, badchars):
+    """Module address ranges and bad char impact on the address space."""
+    from collections import defaultdict
+    lines = []
+    by_module = defaultdict(list)
+    for g in gadgets:
+        by_module[g.module].append(g)
+
+    lines.append('  Module address range analysis:')
+    lines.append('')
+    lines.append(f"    {'Module':<24}  {'Low Addr':>12}  {'High Addr':>12}  {'Gadgets':>8}  {'Clean':>6}  Notes")
+    lines.append(f"    {'-'*24}  {'-'*12}  {'-'*12}  {'-'*8}  {'-'*6}  {'-'*30}")
+
+    for mod in sorted(by_module.keys()):
+        mod_g = by_module[mod]
+        addrs = [g.address for g in mod_g]
+        lo, hi = min(addrs), max(addrs)
+        total_mod = len(mod_g)
+        clean = sum(1 for g in mod_g if not g.has_badchar(badchars))
+        notes = []
+        if (lo & 0xFF000000) == 0:
+            notes.append('null high byte')
+        if 0x10000000 <= lo < 0x20000000:
+            notes.append('standard DLL range')
+        elif 0x00400000 <= lo < 0x01000000:
+            notes.append('standard EXE range')
+        clean_pct = clean / total_mod * 100 if total_mod else 0
+        if clean_pct < 50:
+            notes.append(f'{clean_pct:.0f}% clean')
+        note_str = ', '.join(notes) if notes else 'OK'
+        lines.append(f"    {mod[:24]:<24}  0x{lo:08x}  0x{hi:08x}  {total_mod:>8}  {clean:>6}  {note_str}")
+
+    lines.append('')
+    lines.append('  Bad char impact on address bytes:')
+    lines.append(f"    {'Byte':>6}  {'Eliminated':>12}  {'% of Total':>10}  Note")
+    lines.append(f"    {'-'*6}  {'-'*12}  {'-'*10}  {'-'*40}")
+    bc_notes = {
+        0x00: 'null byte', 0x0a: 'linefeed', 0x0d: 'carriage return',
+        0x09: 'tab', 0x0b: 'vertical tab', 0x0c: 'form feed', 0x20: 'space',
+    }
+    for bc in sorted(badchars):
+        affected = sum(1 for g in gadgets
+                       if any(b == bc for b in struct.pack('<I', g.address)))
+        pct = affected / len(gadgets) * 100 if gadgets else 0
+        note = bc_notes.get(bc, '')
+        lines.append(f"    0x{bc:02x}  {affected:>12,}  {pct:>9.1f}%  {note}")
+
+    return ('Module Address Analysis  (ASLR / Rebase)', 'info', lines)
+
+
+def _section_api_readiness(gadgets, badchars):
+    """VirtualAlloc / WriteProcessMemory ROP chain prerequisites."""
+    _R = r'e[a-z]{2}'
+    checks = [
+        ('pop eax',     rf'pop\s+eax.*ret',
+         'Function pointer / return value'),
+        ('pop ebx',     rf'pop\s+ebx.*ret',
+         'dwSize / parameter setup'),
+        ('pop ecx',     rf'pop\s+ecx.*ret',
+         'lpAddress / lpBuffer'),
+        ('pop edx',     rf'pop\s+edx.*ret',
+         'flAllocationType / nSize'),
+        ('pop esi',     rf'pop\s+esi.*ret',
+         'flProtect / pointer register'),
+        ('pop edi',     rf'pop\s+edi.*ret',
+         'Return address / hProcess'),
+        ('pop ebp',     rf'pop\s+ebp.*ret',
+         'lpNumberOfBytesWritten / frame'),
+        ('pushad',      rf'pushad.*ret',
+         'Push all regs to build API call frame'),
+        ('Zero EAX',    rf'(xor\s+eax,\s*eax|sub\s+eax,\s*eax).*ret',
+         'Null-free zero for parameter setup'),
+        ('Zero EDX',    rf'(xor\s+edx,\s*edx|sub\s+edx,\s*edx|cdq).*ret',
+         'Zero EDX (cdq if EAX positive)'),
+        ('Neg EAX',     rf'neg\s+eax.*ret',
+         'Negate for null-free value encoding'),
+        ('Capture ESP',
+         rf'(mov\s+{_R},\s*esp|lea\s+{_R},\s*\[esp|push\s+esp.*pop\s+{_R}).*ret',
+         'Get current stack address'),
+        ('Mem Write',
+         rf'mov\s+(dword\s*)?\[{_R}[^\]]*\],\s*{_R}.*ret',
+         'Write register to controlled memory'),
+        ('Stack Pivot',
+         rf'(xchg\s+({_R},\s*esp|esp,\s*{_R})|mov\s+esp,\s*{_R}).*ret',
+         'Redirect ESP to controlled buffer'),
+        ('CLD',         rf'cld.*ret',
+         'Direction flag for string operations'),
+        ('STOSD',       rf'stosd.*ret',
+         'Write eax to [edi], edi+=4'),
+    ]
+
+    lines = []
+    lines.append('  VirtualAlloc / WriteProcessMemory ROP chain prerequisites:')
+    lines.append('')
+    lines.append(f"    {'Gadget':<16}  {'Count':>6}  {'Status':<6}  Purpose")
+    lines.append(f"    {'-'*16}  {'-'*6}  {'-'*6}  {'-'*50}")
+
+    ready = 0
+    for name, pattern, purpose in checks:
+        hits = _hit(gadgets, pattern, badchars)
+        count = len(hits)
+        status = 'READY' if count > 0 else 'MISS'
+        if count > 0:
+            ready += 1
+        lines.append(f"    {name:<16}  {count:>6}  {status:<6}  {purpose}")
+
+    total_checks = len(checks)
+    pct = ready / total_checks * 100
+    if pct >= 90:
+        verdict = 'EXCELLENT -- all or nearly all prerequisites available'
+    elif pct >= 70:
+        verdict = 'GOOD -- most available, workarounds may be needed for gaps'
+    elif pct >= 50:
+        verdict = 'PARTIAL -- several missing, chain will require creativity'
+    else:
+        verdict = 'LIMITED -- many missing, consider loading additional modules'
+    lines.append('')
+    lines.append(f"  Readiness: {ready}/{total_checks} ({pct:.0f}%)  --  {verdict}")
+
+    return ('API Chain Readiness  (VirtualAlloc / WriteProcessMemory)', 'info', lines)
+
+
+def _section_reliability(gadgets, badchars):
+    """Reliability flag distribution across clean gadgets."""
+    lines = []
+    clean = [g for g in gadgets if not g.has_badchar(badchars)]
+    total = len(clean)
+    if not total:
+        lines.append('  No clean gadgets to analyse.')
+        return ('Gadget Reliability Summary', 'info', lines)
+
+    categories = [
+        ('Plain ret ending',   r';\s*ret$',
+         'Most reliable -- clean stack return'),
+        ('retn N ending',      r'retn\s+0x',
+         'Needs N bytes of stack padding'),
+        ('Memory dereference', r'(mov|add|sub|or|xor|and)\s+\w+,\s*(dword\s*)?\[',
+         'Requires valid pointer'),
+        ('Memory write',       r'(mov|add|sub|or|xor|and)\s+(dword\s*)?\[',
+         'Target must be writable'),
+        ('ESP modification',   r'(add|sub|xchg|mov)\s+esp',
+         'Changes stack pointer'),
+        ('Call instruction',   r'\bcall\s+',
+         'Pushes return address onto stack'),
+        ('Leave instruction',  r'\bleave\b',
+         'Overwrites ESP and pops EBP'),
+        ('String operations',  r'\b(stosd|lodsd|movsd|stosb|movsb)\b',
+         'Requires CLD + valid ESI/EDI'),
+    ]
+
+    lines.append('  Reliability flags across all clean gadgets:')
+    lines.append('')
+    lines.append(f"    {'Category':<24}  {'Count':>6}  {'% Clean':>8}  Note")
+    lines.append(f"    {'-'*24}  {'-'*6}  {'-'*8}  {'-'*40}")
+
+    for cat_name, pattern, note in categories:
+        count = sum(1 for g in clean if re.search(pattern, g.asm, re.IGNORECASE))
+        pct = count / total * 100
+        lines.append(f"    {cat_name:<24}  {count:>6}  {pct:>7.1f}%  {note}")
+
+    return ('Gadget Reliability Summary', 'info', lines)
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def run_analysis(gadgets: List[Gadget], badchars: bytes,
-                 files: list = None) -> List[Tuple[str, str, List[str]]]:
+                 files: list = None,
+                 progress=None) -> List[Tuple[str, str, List[str]]]:
     """
     Run all analysis sections and return a list of (title, status, lines).
     status is always 'info' — users differentiate pass/fail themselves.
+
+    progress: optional callback(step: int, total: int, label: str)
+              called before each section so the UI can show progress.
     """
+    _search_cache.clear()
     g, b = gadgets, badchars
-    return [
-        _section_overview(g, b, files),
-        _section_eax_hub(g, b),
-        _section_path_analysis(g, b),
-        _section_memwrite_map(g, b),
-        _section_memload_map(g, b),
-        _section_mov_matrix(g, b),
-        _section_pp_matrix(g, b),
-        _section_xchg_matrix(g, b),
-        _section_memwrite_matrix(g, b),
-        _section_memread_matrix(g, b),
-        _section_addsub_matrix(g, b),
-        _section_incdecneg(g, b),
-        _section_capture_esp(g, b),
-        _section_zero_register(g, b),
-        _section_stack_pivot(g, b),
-        _section_key_singles(g, b),
+
+    steps = [
+        ("Overview",              lambda: _section_overview(g, b, files)),
+        ("Quality Distribution",  lambda: _section_quality_distribution(g, b)),
+        ("Cross-Module Compare",  lambda: _section_cross_module(g, b)),
+        ("Module Addresses",      lambda: _section_aslr_awareness(g, b)),
+        ("API Chain Readiness",   lambda: _section_api_readiness(g, b)),
+        ("Reliability Summary",   lambda: _section_reliability(g, b)),
+        ("Capture ESP",           lambda: _section_capture_esp(g, b)),
+        ("Stack Pivot",           lambda: _section_stack_pivot(g, b)),
+        ("EAX Hub Map",           lambda: _section_eax_hub(g, b)),
+        ("Multi-Hop Paths",       lambda: _section_path_analysis(g, b)),
+        ("Memory Write Map",      lambda: _section_memwrite_map(g, b)),
+        ("Memory Load Map",       lambda: _section_memload_map(g, b)),
+        ("MOV Matrix",            lambda: _section_mov_matrix(g, b)),
+        ("Push/Pop Matrix",       lambda: _section_pp_matrix(g, b)),
+        ("XCHG Matrix",           lambda: _section_xchg_matrix(g, b)),
+        ("Mem Write Matrix",      lambda: _section_memwrite_matrix(g, b)),
+        ("Mem Read Matrix",       lambda: _section_memread_matrix(g, b)),
+        ("Add/Sub Matrix",        lambda: _section_addsub_matrix(g, b)),
+        ("Inc/Dec/Neg",           lambda: _section_incdecneg(g, b)),
+        ("Zero Register",         lambda: _section_zero_register(g, b)),
+        ("Key Instructions",      lambda: _section_key_singles(g, b)),
     ]
+
+    results = []
+    total = len(steps)
+    for i, (label, fn) in enumerate(steps):
+        if progress:
+            progress(i, total, label)
+        results.append(fn())
+    return results

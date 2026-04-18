@@ -18,10 +18,10 @@ import os
 import re
 import struct
 from typing import List, Optional
-from search import Gadget, parse_rpp_file, search_gadgets
-from nullcheck import check_value, analyze_value, suggest_alternatives, DEFAULT_BADCHARS
-from suggest import GOALS, resolve_goal, suggest_for_goal
-from chain import RopChain
+from core.search import Gadget, parse_rpp_file, search_gadgets
+from core.nullcheck import check_value, analyze_value, suggest_alternatives, DEFAULT_BADCHARS
+from core.suggest import GOALS, resolve_goal, suggest_for_goal
+from core.chain import RopChain
 
 
 # ── Color pair IDs ─────────────────────────────────────────────────────────────
@@ -59,8 +59,8 @@ class AppState:
         self.search_query: str = ""
         self.selected_idx: int = 0
         self.chain = RopChain()
-        self.active_tab: int = 5
-        self.status_msg: str = "ChainForge ready  |  ? help  |  1-4 switch tabs  |  q quit"
+        self.active_tab: int = 0
+        self.status_msg: str = "ChainForge ready  |  ? help  |  1-6 switch tabs  |  q quit"
         self.scroll_offset: int = 0
         self.suggest_goal: str = ""
         self.suggest_results: dict = {}
@@ -77,6 +77,8 @@ class AppState:
         self.analysis_rows: list = []     # flat display rows from last analysis
         self.analysis_scroll: int = 0     # scroll offset for analysis tab
         self.analysis_done: bool = False  # whether analysis has been run
+        self.search_history: List[str] = []
+        self.history_idx: int = -1
 
 
 # ── Safe draw helper ───────────────────────────────────────────────────────────
@@ -99,12 +101,14 @@ def safe_addstr(win, y, x, text, attr=0):
 
 # ── Blocking line input ────────────────────────────────────────────────────────
 
-def read_line(win, y, x, prompt: str, initial: str = "") -> Optional[str]:
+def read_line(win, y, x, prompt: str, initial: str = "",
+              history: List[str] = None) -> Optional[str]:
     """
     Blocking single-line input drawn at (y, x).
     Returns the string entered, or None if user pressed Escape.
     Uses character-by-character getch() with timeout(-1) so the
     main loop cannot race and redraw over this.
+    Optional history list: UP/DOWN cycles through previous inputs.
     """
     h, w = win.getmaxyx()
     px = x
@@ -116,6 +120,8 @@ def read_line(win, y, x, prompt: str, initial: str = "") -> Optional[str]:
 
     buf = list(initial)
     cur = len(buf)
+    hist_idx = len(history) if history else 0
+    saved_buf = None
 
     def redraw():
         safe_addstr(win, y, px, prompt, curses.color_pair(C_CYAN) | curses.A_BOLD)
@@ -159,6 +165,21 @@ def read_line(win, y, x, prompt: str, initial: str = "") -> Optional[str]:
             cur = 0
         elif ch == curses.KEY_END:
             cur = len(buf)
+        elif ch == curses.KEY_UP and history:
+            if hist_idx > 0:
+                if hist_idx == len(history):
+                    saved_buf = list(buf)
+                hist_idx -= 1
+                buf = list(history[hist_idx])
+                cur = len(buf)
+        elif ch == curses.KEY_DOWN and history:
+            if hist_idx < len(history):
+                hist_idx += 1
+                if hist_idx == len(history):
+                    buf = saved_buf if saved_buf is not None else []
+                else:
+                    buf = list(history[hist_idx])
+                cur = len(buf)
         elif 32 <= ch <= 126 and len(buf) < max_len:
             buf.insert(cur, chr(ch))
             cur += 1
@@ -175,16 +196,13 @@ def read_line(win, y, x, prompt: str, initial: str = "") -> Optional[str]:
 def draw_title_bar(win, state: AppState):
     h, w = win.getmaxyx()
     tabs = ["[1] Analysis", "[2] Search", "[3] Suggest", "[4] Chain", "[5] NullChk", "[6] RegEx CheatSheet"]
-    # Map display position (0-5) to the internal active_tab index
-    # Key 1=Analysis(5), 2=Search(0), 3=Suggest(1), 4=Chain(2), 5=NullChk(3), 6=CheatSheet(4)
-    tab_display_to_internal = [5, 0, 1, 2, 3, 4]
     title = " ChainForge "
     win.hline(0, 0, ' ', w)
     safe_addstr(win, 0, 1, title,
                 curses.color_pair(C_TITLE) | curses.A_BOLD)
     x = len(title) + 2
     for i, tab in enumerate(tabs):
-        is_active = tab_display_to_internal[i] == state.active_tab
+        is_active = i == state.active_tab
         attr = curses.color_pair(C_HIGHLIGHT) if is_active \
                else curses.color_pair(C_TITLE)
         safe_addstr(win, 0, x, f" {tab} ", attr)
@@ -247,8 +265,17 @@ def draw_search_tab(win, state: AppState):
     h, w = win.getmaxyx()
     y = 2
 
-    # ── Header: line 1 — mode + query ──────────────────────────────────────────
-    # Mode badge
+    # ── Help lines at top ────────────────────────────────────────────────────
+    safe_addstr(win, y, 2,
+                "/=search  x=regex  n=refine  c=clear  Enter=add  a=add all  L=load",
+                curses.color_pair(C_DIM))
+    y += 1
+    safe_addstr(win, y, 2,
+                "UP/DN=scroll  PgUp/PgDn=page  (in / prompt: UP/DN=search history)",
+                curses.color_pair(C_DIM))
+    y += 1
+
+    # ── Mode + query ─────────────────────────────────────────────────────────
     if state.regex_mode:
         mode_label = "[REGEX]"
         mode_attr  = curses.color_pair(C_WARN) | curses.A_BOLD
@@ -256,36 +283,43 @@ def draw_search_tab(win, state: AppState):
         mode_label = "[plain]"
         mode_attr  = curses.color_pair(C_DIM)
     safe_addstr(win, y, 2, mode_label, mode_attr)
-
-    # "Query:" label
     safe_addstr(win, y, 11, "Query:", curses.color_pair(C_CYAN))
-
-    # Query value or hint — keep well clear of right edge
     if state.search_query:
-        q_text = state.search_query[:w - 18]
-        safe_addstr(win, y, 18, q_text, curses.color_pair(C_GOOD))
+        safe_addstr(win, y, 18, state.search_query[:w - 18],
+                    curses.color_pair(C_GOOD))
     else:
-        hint = "/=plain search  |  addr: 0x10012f97 or partial 10012f"
-        safe_addstr(win, y, 18, hint[:w - 18], curses.color_pair(C_DIM))
+        safe_addstr(win, y, 18,
+                    "/=plain search  |  addr: 0x10012f97 or partial 10012f"[:w - 18],
+                    curses.color_pair(C_DIM))
     y += 1
 
-    # ── Header: line 2 — result count + sort info ────────────────────────────
+    # ── Result count + sort info ─────────────────────────────────────────────
     if state.search_results:
         count_str = f"{len(state.search_results):,} results"
         safe_addstr(win, y, 2, count_str, curses.color_pair(C_CYAN))
         sort_info = "  sorted: plain ret  ->  fewest instructions  ->  score"
         safe_addstr(win, y, 2 + len(count_str), sort_info[:w - 4 - len(count_str)],
                     curses.color_pair(C_DIM))
-    else:
-        safe_addstr(win, y, 2,
-                    "No results" if state.search_query else
-                    "Load a file with L, then press / to search",
-                    curses.color_pair(C_DIM))
+    elif state.search_query:
+        safe_addstr(win, y, 2, "No results", curses.color_pair(C_DIM))
     y += 1
+
+    # ── Side effects ─────────────────────────────────────────────────────────
+    if state.search_results and state.selected_idx < len(state.search_results):
+        sel_g = state.search_results[state.selected_idx]
+        cse = sel_g.compact_side_effects()
+        if cse:
+            safe_addstr(win, y, 2, "Side Effects:", curses.color_pair(C_WARN) | curses.A_BOLD)
+            safe_addstr(win, y, 16, cse[:w - 18], curses.color_pair(C_WARN))
+        else:
+            safe_addstr(win, y, 2, "Side Effects:", curses.color_pair(C_DIM))
+            safe_addstr(win, y, 16, "none", curses.color_pair(C_DIM))
+        y += 1
+
     win.hline(y, 0, curses.ACS_HLINE, w)
     y += 1
 
-    visible_h = h - y - 3
+    visible_h = h - y - 1
     start = state.scroll_offset
     hl = state.highlight_query
 
@@ -314,7 +348,6 @@ def draw_search_tab(win, state: AppState):
         safe_addstr(win, row, 2, "[+]" if clean else "[!]", sc)
         safe_addstr(win, row, 6, ret_ind, ret_attr)
 
-        # ── instruction count (green<=2, yellow<=4, dim>=5) ───────────────────
         n_instrs = len(g.instructions)
         cnt_str  = f"{n_instrs:2}"
         cnt_attr = (curses.color_pair(C_GOOD) if n_instrs <= 2 else
@@ -337,7 +370,6 @@ def draw_search_tab(win, state: AppState):
                            else "  -- try broadening your search or use x for regex"),
                         curses.color_pair(C_DIM))
         else:
-            # ── Regex quick-start guide ───────────────────────────────────────
             CY  = curses.color_pair(C_CYAN)
             WN  = curses.color_pair(C_WARN)
             DIM = curses.color_pair(C_DIM)
@@ -380,28 +412,23 @@ def draw_search_tab(win, state: AppState):
                 (r"\b",         "word boundary          e.g.  \\beax\\b  won't match 'eaxh'"),
             ]
             for pat, desc in entries:
-                if row >= h - 4:
+                if row >= h - 2:
                     break
                 sh(row, 4,  pat,  WN)
                 sh(row, 18, desc, DIM)
                 row += 1
 
             row += 1
-            if row < h - 4:
+            if row < h - 2:
                 sh(row, 2, "Tip:", CY)
                 sh(row, 8, "Use the [5] RegEx CheatSheet tab to browse pre-built patterns with strict/loose tags.", DIM)
-
-
-    safe_addstr(win, h - 2, 2,
-                "/=search (ASM or address)  x=regex  n=refine  c=clear  UP/DN=scroll  Enter=add to chain  L=load",
-                curses.color_pair(C_DIM))
 
 
 def handle_search_key(win, key, state: AppState):
     h, w = win.getmaxyx()
 
     if key in (ord('/'), ord('s')):
-        q = read_line(win, 2, 2, "/ Search: ", "")   # empty — new search
+        q = read_line(win, 2, 2, "/ Search: ", "", history=state.search_history)
         if q is not None:
             state.search_query = q
             state.highlight_query = q
@@ -416,9 +443,11 @@ def handle_search_key(win, key, state: AppState):
             state.scroll_offset = 0
             n = len(state.search_results)
             state.status_msg = f"Plain search: {n} results for '{q}'"
+            if q and (not state.search_history or state.search_history[-1] != q):
+                state.search_history.append(q)
 
     elif key in (ord('x'), ord('X'), ord('R'), ord('r')):
-        q = read_line(win, 2, 2, "x Regex: ", "")   # empty — new search
+        q = read_line(win, 2, 2, "x Regex: ", "", history=state.search_history)
         if q is not None:
             # Validate regex before running — show error in status bar
             try:
@@ -440,11 +469,14 @@ def handle_search_key(win, key, state: AppState):
             state.scroll_offset = 0
             n = len(state.search_results)
             state.status_msg = f"Regex: {n} results for '{q}'"
+            if q and (not state.search_history or state.search_history[-1] != q):
+                state.search_history.append(q)
 
     elif key == ord('n'):
         # Refine — pre-fills last query so you can edit and re-run
         if state.search_query:
-            q = read_line(win, 2, 2, "n Refine: ", state.search_query)
+            q = read_line(win, 2, 2, "n Refine: ", state.search_query,
+                          history=state.search_history)
             if q is not None:
                 state.search_query = q
                 state.highlight_query = q if not state.regex_mode else ""
@@ -459,11 +491,13 @@ def handle_search_key(win, key, state: AppState):
                 n = len(state.search_results)
                 mode = "Regex" if state.regex_mode else "Plain"
                 state.status_msg = f"{mode} refine: {n} results for '{q}'"
+                if q and (not state.search_history or state.search_history[-1] != q):
+                    state.search_history.append(q)
 
     elif key == curses.KEY_DOWN:
         if state.selected_idx < len(state.search_results) - 1:
             state.selected_idx += 1
-            if state.selected_idx >= state.scroll_offset + (h - 8):
+            if state.selected_idx >= state.scroll_offset + (h - 10):
                 state.scroll_offset += 1
 
     elif key == curses.KEY_UP:
@@ -472,10 +506,21 @@ def handle_search_key(win, key, state: AppState):
             if state.selected_idx < state.scroll_offset:
                 state.scroll_offset -= 1
 
+    elif key == curses.KEY_NPAGE:
+        page = max(1, h - 10)
+        total = len(state.search_results)
+        state.selected_idx = min(state.selected_idx + page, total - 1)
+        state.scroll_offset = min(state.scroll_offset + page, max(0, total - page))
+
+    elif key == curses.KEY_PPAGE:
+        page = max(1, h - 10)
+        state.selected_idx = max(state.selected_idx - page, 0)
+        state.scroll_offset = max(state.scroll_offset - page, 0)
+
     elif key in (10, 13, curses.KEY_ENTER):
         if state.search_results and state.selected_idx < len(state.search_results):
             g = state.search_results[state.selected_idx]
-            comment = read_line(win, h - 3, 2, "Comment: ", g.asm)
+            comment = read_line(win, h - 2, 2, "Comment: ", g.asm)
             if comment is not None:
                 state.chain.add(g.address, comment or g.asm)
                 state.status_msg = f"Added {g.addr_str}  ({len(state.chain.entries)} in chain)"
@@ -664,7 +709,7 @@ GOAL_DESCRIPTIONS = {k: v[0] for k, v in GOAL_CATALOGUE.items()}
 
 def _goal_desc(goal_key: str) -> str:
     """Get human-readable description for a goal, including dynamic ones."""
-    from suggest import goal_display_name
+    from core.suggest import goal_display_name
     if goal_key in GOAL_DESCRIPTIONS:
         return GOAL_DESCRIPTIONS[goal_key]
     # Dynamic goals — generate description from key
@@ -709,7 +754,17 @@ def draw_suggest_tab(win, state: AppState):
     h, w = win.getmaxyx()
     y = 2
 
-    # Goal line + description
+    # ── Help lines at top ────────────────────────────────────────────────────
+    safe_addstr(win, y, 2,
+                "/=new goal  n=refine  Enter=add to chain  c=clear  L=load",
+                curses.color_pair(C_DIM))
+    y += 1
+    safe_addstr(win, y, 2,
+                "UP/DN=navigate  PgUp/PgDn=page",
+                curses.color_pair(C_DIM))
+    y += 1
+
+    # ── Goal line + description ──────────────────────────────────────────────
     safe_addstr(win, y, 2, "Goal: ", curses.color_pair(C_CYAN))
     goal_disp = state.suggest_goal or "(press / to set goal)"
     safe_addstr(win, y, 8, goal_disp[:w - 10], curses.color_pair(C_DIM))
@@ -724,10 +779,7 @@ def draw_suggest_tab(win, state: AppState):
 
     if not state.suggest_results:
         if not state.suggest_goal:
-            # ── Goal catalogue browser ────────────────────────────────────────
-            # Shows scrollable list: goal name + description + query examples
             cat_keys = list(GOAL_CATALOGUE.keys())
-            # prepend dynamic examples
             dynamic_entries = [
                 ("copy eax  (out)",       "copy eax OUT to any register — eax is the source",
                  ["copy eax", "move esi", "copy ecx to edx"]),
@@ -747,18 +799,7 @@ def draw_suggest_tab(win, state: AppState):
                  ["add eax", "add ebx", "subtract ecx"]),
             ]
 
-            safe_addstr(win, y, 2,
-                        "/  to search a goal  |  UP/DN to scroll  |  1 to return to Search",
-                        curses.color_pair(C_DIM))
-            y += 1
-            win.hline(y, 0, curses.ACS_HLINE, w)
-            y += 1
-
-            # Build flat list of display rows
-            # Each entry: (indent, text, attr)
             all_rows = []
-
-            # Static goals from catalogue
             all_rows.append((0, "  STATIC GOALS", curses.color_pair(C_CYAN) | curses.A_BOLD))
             all_rows.append((0, "", 0))
             for key, (desc, examples, asm_examples) in GOAL_CATALOGUE.items():
@@ -770,7 +811,6 @@ def draw_suggest_tab(win, state: AppState):
                 all_rows.append((2, asm_str[:w-6], curses.color_pair(C_GOOD)))
                 all_rows.append((0, "", 0))
 
-            # Dynamic examples
             all_rows.append((0, "  DYNAMIC GOALS  (register-aware)", curses.color_pair(C_CYAN) | curses.A_BOLD))
             all_rows.append((0, "", 0))
             for name, desc, examples in dynamic_entries:
@@ -780,11 +820,11 @@ def draw_suggest_tab(win, state: AppState):
                 all_rows.append((2, ex_str[:w-6], curses.color_pair(C_DIM)))
                 all_rows.append((0, "", 0))
 
-            visible_h = h - y - 3
+            visible_h = h - y - 1
             scroll = state.scroll_offset
             total = len(all_rows)
             for row_data in all_rows[scroll:scroll + visible_h]:
-                if y >= h - 3:
+                if y >= h - 1:
                     break
                 indent, text, attr = row_data
                 if text:
@@ -792,20 +832,38 @@ def draw_suggest_tab(win, state: AppState):
                 y += 1
 
             if total > visible_h:
-                safe_addstr(win, h - 3, w - 20,
+                safe_addstr(win, h - 2, w - 20,
                             f"[{scroll+1}-{min(scroll+visible_h, total)}/{total}]",
                             curses.color_pair(C_DIM))
         else:
             safe_addstr(win, y + 2, 4,
                         "No gadgets found. Load a gadget file with L, or try a different goal.",
                         curses.color_pair(C_DIM))
-        safe_addstr(win, h - 2, 2,
-                    "/=search goal  c=clear  L=load file  UP/DN=scroll",
-                    curses.color_pair(C_DIM))
         return
 
     # ── Results — scrollable, sorted, highlighted ────────────────────────────
-    visible_h = h - y - 3
+
+    # Build gadget_flat early so we can show side-effects above results
+    _pre_flat_rows = []
+    for desc, gs in state.suggest_results.items():
+        _pre_flat_rows.append((True, f"-- {desc}  ({len(gs)})", curses.color_pair(C_CYAN)))
+        for g in gs:
+            _pre_flat_rows.append((False, g, 0))
+        _pre_flat_rows.append((True, "", 0))
+    _pre_gadget_flat = [item[1] for item in _pre_flat_rows if not item[0]]
+
+    if _pre_gadget_flat and state.suggest_sel < len(_pre_gadget_flat):
+        sel_g = _pre_gadget_flat[state.suggest_sel]
+        cse = sel_g.compact_side_effects()
+        if cse:
+            safe_addstr(win, y, 2, "Side Effects:", curses.color_pair(C_WARN) | curses.A_BOLD)
+            safe_addstr(win, y, 16, cse[:w - 18], curses.color_pair(C_WARN))
+        else:
+            safe_addstr(win, y, 2, "Side Effects:", curses.color_pair(C_DIM))
+            safe_addstr(win, y, 16, "none", curses.color_pair(C_DIM))
+        y += 1
+
+    visible_h = h - y - 1
     flat_rows = []  # (is_header, content, attr)
     #   is_header=True  -> content is a string label
     #   is_header=False -> content is a Gadget object
@@ -864,7 +922,7 @@ def draw_suggest_tab(win, state: AppState):
     gadget_display_idx = 0  # tracks which gadget we're on across flat_rows
 
     for item in flat_rows[start:start + visible_h]:
-        if row >= h - 3:
+        if row >= h - 1:
             break
         is_header = item[0]
         content   = item[1]
@@ -926,17 +984,12 @@ def draw_suggest_tab(win, state: AppState):
 
         row += 1
 
-    # scroll indicator
     total = len(flat_rows)
     shown = min(visible_h, total - start)
     if total > visible_h:
-        safe_addstr(win, h - 3, w - 22,
+        safe_addstr(win, h - 2, w - 22,
                     f"[{start+1}-{start+shown}/{total}]",
                     curses.color_pair(C_DIM))
-
-    safe_addstr(win, h - 2, 2,
-                "/=new goal  n=refine goal  UP/DN=navigate  Enter=add to chain  c=clear  L=load",
-                curses.color_pair(C_DIM))
 
 
 def handle_suggest_key(win, key, state: AppState):
@@ -945,7 +998,7 @@ def handle_suggest_key(win, key, state: AppState):
     if key in (ord('/'), ord('g')):
         q = read_line(win, 2, 2, "/ Goal: ", "")   # empty — new goal
         if q:
-            from suggest import goal_display_name
+            from core.suggest import goal_display_name
             goal = resolve_goal(q.strip())
             if goal:
                 state.suggest_goal = goal
@@ -962,7 +1015,7 @@ def handle_suggest_key(win, key, state: AppState):
     elif key == ord('n'):
         # Refine — pre-fills last goal so you can edit it
         if state.suggest_goal:
-            from suggest import goal_display_name
+            from core.suggest import goal_display_name
             prev = goal_display_name(state.suggest_goal)
             q = read_line(win, 2, 2, "n Refine goal: ", prev)
             if q:
@@ -1005,6 +1058,19 @@ def handle_suggest_key(win, key, state: AppState):
         else:
             state.scroll_offset = max(0, state.scroll_offset - 1)
 
+    elif key == curses.KEY_NPAGE:
+        page = max(1, h - 10)
+        if state.suggest_results:
+            all_gadgets = [g for gs in state.suggest_results.values() for g in gs]
+            state.suggest_sel = min(state.suggest_sel + page, max(0, len(all_gadgets) - 1))
+        state.scroll_offset += page
+
+    elif key == curses.KEY_PPAGE:
+        page = max(1, h - 10)
+        if state.suggest_results:
+            state.suggest_sel = max(state.suggest_sel - page, 0)
+        state.scroll_offset = max(0, state.scroll_offset - page)
+
     elif key in (10, 13, curses.KEY_ENTER):
         # Add currently selected gadget to chain
         if state.suggest_results:
@@ -1040,6 +1106,16 @@ def draw_chain_tab(win, state: AppState):
     chain = state.chain
     issues = dict(chain.validate())
 
+    # ── Help lines at top ────────────────────────────────────────────────────
+    safe_addstr(win, y, 2,
+                "a=add  p=pad  d=del  K/J=move  e=export  v=validate  S=save  O=import  N=rename",
+                curses.color_pair(C_DIM))
+    y += 1
+    safe_addstr(win, y, 2,
+                "UP/DN=navigate  PgUp/PgDn=page  c=nullcheck  r=regex pick",
+                curses.color_pair(C_DIM))
+    y += 1
+
     safe_addstr(win, y, 2,
                 f"Chain: {chain.name}   {len(chain.entries)} entries   "
                 f"bad: {','.join(hex(b) for b in chain.badchars)}",
@@ -1048,7 +1124,7 @@ def draw_chain_tab(win, state: AppState):
     win.hline(y, 0, curses.ACS_HLINE, w)
     y += 1
 
-    visible_h = h - y - 4
+    visible_h = h - y - 1
     start = state.scroll_offset
 
     for i, entry in enumerate(chain.entries[start:start + visible_h]):
@@ -1076,13 +1152,6 @@ def draw_chain_tab(win, state: AppState):
                     "Chain is empty  --  search a gadget and press Enter to add it",
                     curses.color_pair(C_DIM))
 
-    safe_addstr(win, h - 3, 2,
-                "a=add  p=pad  d=del  K=move up  J=move down  e=export  v=validate  S=save  O=import",
-                curses.color_pair(C_DIM))
-    safe_addstr(win, h - 2, 2,
-                "UP/DN=navigate  c=nullcheck  r=regex pick  N=rename",
-                curses.color_pair(C_DIM))
-
 
 def handle_chain_key(win, key, state: AppState):
     h, w = win.getmaxyx()
@@ -1091,7 +1160,7 @@ def handle_chain_key(win, key, state: AppState):
     if key == curses.KEY_DOWN:
         if state.selected_idx < len(chain.entries) - 1:
             state.selected_idx += 1
-            if state.selected_idx >= state.scroll_offset + (h - 9):
+            if state.selected_idx >= state.scroll_offset + (h - 8):
                 state.scroll_offset += 1
 
     elif key == curses.KEY_UP:
@@ -1099,6 +1168,17 @@ def handle_chain_key(win, key, state: AppState):
             state.selected_idx -= 1
             if state.selected_idx < state.scroll_offset:
                 state.scroll_offset -= 1
+
+    elif key == curses.KEY_NPAGE:
+        page = max(1, h - 8)
+        total = len(chain.entries)
+        state.selected_idx = min(state.selected_idx + page, max(0, total - 1))
+        state.scroll_offset = min(state.scroll_offset + page, max(0, total - page))
+
+    elif key == curses.KEY_PPAGE:
+        page = max(1, h - 8)
+        state.selected_idx = max(state.selected_idx - page, 0)
+        state.scroll_offset = max(state.scroll_offset - page, 0)
 
     elif key == ord('a'):
         addr_str = read_line(win, h - 5, 2, "Address (hex): ")
@@ -1141,7 +1221,7 @@ def handle_chain_key(win, key, state: AppState):
         if chain.entries and idx < len(chain.entries) - 1:
             chain.entries[idx], chain.entries[idx + 1] =                 chain.entries[idx + 1], chain.entries[idx]
             state.selected_idx += 1
-            if state.selected_idx >= state.scroll_offset + (h - 9):
+            if state.selected_idx >= state.scroll_offset + (h - 8):
                 state.scroll_offset += 1
             state.status_msg = f"Moved [{idx}] down  ->  [{idx + 1}]"
 
@@ -1177,7 +1257,7 @@ def handle_chain_key(win, key, state: AppState):
                 state.session_log.append(f"[!] Chain import failed — file not found: {path}")
             else:
                 try:
-                    from chain import RopChain
+                    from core.chain import RopChain
                     with open(path) as f:
                         loaded = RopChain.from_json(f.read())
                     n = len(loaded.entries)
@@ -1334,6 +1414,13 @@ def _popup_export(win, state: AppState):
 def draw_nullcheck_tab(win, state: AppState):
     h, w = win.getmaxyx()
     y = 2
+
+    # ── Help lines at top ────────────────────────────────────────────────────
+    safe_addstr(win, y, 2,
+                "n=check value  m=check multiple  b=set bad chars",
+                curses.color_pair(C_DIM))
+    y += 1
+
     safe_addstr(win, y, 2, "Value: ", curses.color_pair(C_CYAN))
     safe_addstr(win, y, 9,
                 state.nullcheck_value or "(press n to check a value)",
@@ -1341,7 +1428,7 @@ def draw_nullcheck_tab(win, state: AppState):
     y += 2
 
     for line in state.nullcheck_output:
-        if y >= h - 3:
+        if y >= h - 1:
             break
         line = line.strip()
         if not line:
@@ -1357,10 +1444,6 @@ def draw_nullcheck_tab(win, state: AppState):
             attr = curses.color_pair(C_DIM)
         safe_addstr(win, y, 2, line[:w - 4], attr)
         y += 1
-
-    safe_addstr(win, h - 2, 2,
-                "n=check value  m=check multiple  b=set bad chars",
-                curses.color_pair(C_DIM))
 
 
 def handle_nullcheck_key(win, key, state: AppState):
@@ -1514,6 +1597,16 @@ def draw_cheatsheet_tab(win, state: AppState):
     h, w = win.getmaxyx()
     y = 2
 
+    # ── Help lines at top ────────────────────────────────────────────────────
+    safe_addstr(win, y, 2,
+                "/=filter  c=clear  Enter=copy to search",
+                curses.color_pair(C_DIM))
+    y += 1
+    safe_addstr(win, y, 2,
+                "UP/DN=scroll  PgUp/PgDn=page",
+                curses.color_pair(C_DIM))
+    y += 1
+
     # Filter input row
     safe_addstr(win, y, 2, "Filter: ", curses.color_pair(C_CYAN))
     filt = state.cheat_filter or "(/ to filter by section or keyword)"
@@ -1564,9 +1657,6 @@ def draw_cheatsheet_tab(win, state: AppState):
         safe_addstr(win, y + 2, 4,
                     f"No entries match: {state.cheat_filter!r}",
                     curses.color_pair(C_DIM))
-        safe_addstr(win, h - 2, 2,
-                    "/=filter  c=clear  UP/DN=nav  Enter=run in Search  1=Search tab",
-                    curses.color_pair(C_DIM))
         return
 
     # Clamp selection and scroll
@@ -1575,19 +1665,19 @@ def draw_cheatsheet_tab(win, state: AppState):
         state.cheat_sel = max(0, min(state.cheat_sel, len(pattern_indices) - 1))
         sel_flat_idx = pattern_indices[state.cheat_sel]
         # Auto-scroll to keep selection visible
-        visible_h = h - y - 3
+        visible_h = h - y - 1
         if sel_flat_idx < state.cheat_scroll:
             state.cheat_scroll = sel_flat_idx
         elif sel_flat_idx >= state.cheat_scroll + visible_h:
             state.cheat_scroll = sel_flat_idx - visible_h + 1
 
     # Draw visible rows
-    visible_h = h - y - 3
+    visible_h = h - y - 1
     pat_counter = 0
     for i, (typ, content, attr) in enumerate(flat[state.cheat_scroll:
                                                     state.cheat_scroll + visible_h]):
         abs_i = state.cheat_scroll + i
-        if y >= h - 3:
+        if y >= h - 1:
             break
 
         if typ == "blank":
@@ -1627,17 +1717,12 @@ def draw_cheatsheet_tab(win, state: AppState):
             safe_addstr(win, y, 0, content[:w - 1], attr)
         y += 1
 
-    # Scroll indicator
     total = len(flat)
     shown = min(visible_h, total - state.cheat_scroll)
     if total > visible_h:
-        safe_addstr(win, h - 3, w - 20,
+        safe_addstr(win, h - 2, w - 20,
                     f"[{state.cheat_scroll+1}-{state.cheat_scroll+shown}/{total}]",
                     curses.color_pair(C_DIM))
-
-    safe_addstr(win, h - 2, 2,
-                "/=filter  c=clear  UP/DN=scroll  Enter=copy to search  1=Search",
-                curses.color_pair(C_DIM))
 
 
 def handle_cheatsheet_key(win, key, state: AppState):
@@ -1691,6 +1776,18 @@ def handle_cheatsheet_key(win, key, state: AppState):
         else:
             state.cheat_scroll = max(0, state.cheat_scroll - 1)
 
+    elif key == curses.KEY_NPAGE:
+        page = max(1, h - 5)
+        if pattern_indices:
+            state.cheat_sel = min(state.cheat_sel + page, len(pattern_indices) - 1)
+        state.cheat_scroll = min(state.cheat_scroll + page,
+                                 max(0, len(flat) - (h - 5)))
+
+    elif key == curses.KEY_PPAGE:
+        page = max(1, h - 5)
+        state.cheat_sel = max(state.cheat_sel - page, 0)
+        state.cheat_scroll = max(0, state.cheat_scroll - page)
+
     elif key in (10, 13, curses.KEY_ENTER):
         # Copy selected pattern to search tab and switch to it
         if pattern_items and state.cheat_sel < len(pattern_items):
@@ -1708,7 +1805,7 @@ def handle_cheatsheet_key(win, key, state: AppState):
             )
             state.selected_idx = 0
             state.scroll_offset = 0
-            state.active_tab = 0
+            state.active_tab = 1
             state.dirty = True
             n = len(state.search_results)
             state.status_msg = (f"Cheatsheet regex: {n} results  |  "
@@ -1719,7 +1816,6 @@ def handle_cheatsheet_key(win, key, state: AppState):
 
 def _build_analysis_flat(sections, w):
     """Flatten analysis sections into display rows: (text, attr_key)"""
-    from ui.tui import C_CYAN, C_GOOD, C_WARN, C_BAD, C_DIM
     rows = []
     STATUS_ATTR = {
         'ok':      C_GOOD,
@@ -1740,6 +1836,16 @@ def draw_analysis_tab(win, state: AppState):
     h, w = win.getmaxyx()
     y = 2
 
+    # ── Help lines at top ────────────────────────────────────────────────────
+    safe_addstr(win, y, 2,
+                "a=run analysis  c=clear  L=load file",
+                curses.color_pair(C_DIM))
+    y += 1
+    safe_addstr(win, y, 2,
+                "UP/DN=scroll  PgUp/PgDn=page  (OK=green  warn=yellow  missing=red)",
+                curses.color_pair(C_DIM))
+    y += 1
+
     safe_addstr(win, y, 2, "DLL Capability Analysis", curses.color_pair(C_CYAN) | curses.A_BOLD)
     if state.gadgets:
         g_str = f"  ({len(state.gadgets):,} gadgets from {len(state.files)} file(s))"
@@ -1753,21 +1859,14 @@ def draw_analysis_tab(win, state: AppState):
         safe_addstr(win, y + 2, 4,
                     "No gadgets loaded — load a file with L in the Search tab first",
                     curses.color_pair(C_DIM))
-        safe_addstr(win, h - 2, 2,
-                    "a=run analysis  L=load file",
-                    curses.color_pair(C_DIM))
         return
 
     if not state.analysis_done:
         safe_addstr(win, y + 2, 4,
                     "Press a to run analysis  (may take a few seconds)",
                     curses.color_pair(C_WARN))
-        safe_addstr(win, h - 2, 2,
-                    "a=run analysis  UP/DN=scroll  c=clear",
-                    curses.color_pair(C_DIM))
         return
 
-    # Draw flat rows
     STATUS_COLORS = {
         C_CYAN:  curses.color_pair(C_CYAN)  | curses.A_BOLD,
         C_GOOD:  curses.color_pair(C_GOOD)  | curses.A_BOLD,
@@ -1776,13 +1875,13 @@ def draw_analysis_tab(win, state: AppState):
         C_DIM:   curses.color_pair(C_DIM),
     }
 
-    visible_h = h - y - 3
+    visible_h = h - y - 1
     rows = state.analysis_rows
     start = state.analysis_scroll
     total = len(rows)
 
     for text, attr_key, is_header in rows[start:start + visible_h]:
-        if y >= h - 3:
+        if y >= h - 1:
             break
         if is_header and text:
             safe_addstr(win, y, 0, text[:w - 1],
@@ -1793,13 +1892,9 @@ def draw_analysis_tab(win, state: AppState):
 
     if total > visible_h:
         shown = min(visible_h, total - start)
-        safe_addstr(win, h - 3, w - 22,
+        safe_addstr(win, h - 2, w - 22,
                     f"[{start+1}-{start+shown}/{total}]",
                     curses.color_pair(C_DIM))
-
-    safe_addstr(win, h - 2, 2,
-                "a=re-run  UP/DN=scroll  c=clear  (sections: OK=green  warn=yellow  missing=red)",
-                curses.color_pair(C_DIM))
 
 
 def handle_analysis_key(win, key, state: AppState):
@@ -1809,18 +1904,30 @@ def handle_analysis_key(win, key, state: AppState):
         if not state.gadgets:
             state.status_msg = "No gadgets loaded — use L in Search tab first"
             return
-        state.status_msg = "Running analysis... (this may take a moment)"
-        state.dirty = True
-        win.clear()
-        draw_title_bar(win, state)
-        draw_status_bar(win, state)
-        safe_addstr(win, 5, 4,
-                    "Analysing gadgets — scanning all register combinations...",
-                    curses.color_pair(C_WARN))
-        win.refresh()
 
-        from analysis import run_analysis
-        sections = run_analysis(state.gadgets, state.badchars, files=state.files)
+        bar_w = min(40, w - 20)
+
+        def _progress(step, total, label):
+            pct = step / total
+            filled = int(bar_w * pct)
+            bar = '#' * filled + '-' * (bar_w - filled)
+            win.clear()
+            draw_title_bar(win, state)
+            safe_addstr(win, 4, 4, "Analysing gadgets...",
+                        curses.color_pair(C_WARN) | curses.A_BOLD)
+            safe_addstr(win, 6, 4, f"[{bar}]  {int(pct * 100):>3}%",
+                        curses.color_pair(C_CYAN))
+            safe_addstr(win, 8, 4, f"Stage {step + 1}/{total}:  {label}",
+                        curses.color_pair(C_DIM))
+            safe_addstr(win, 10, 4,
+                        f"{len(state.gadgets):,} gadgets across {len(state.files)} file(s)",
+                        curses.color_pair(C_DIM))
+            win.refresh()
+
+        from analysis.analysis import run_analysis
+        _progress(0, 21, "Overview")
+        sections = run_analysis(state.gadgets, state.badchars,
+                                files=state.files, progress=_progress)
 
         # Flatten for display
         rows = []
@@ -1852,6 +1959,17 @@ def handle_analysis_key(win, key, state: AppState):
 
     elif key == curses.KEY_UP:
         state.analysis_scroll = max(0, state.analysis_scroll - 1)
+
+    elif key == curses.KEY_NPAGE:
+        page = max(1, h - 8)
+        if state.analysis_rows:
+            state.analysis_scroll = min(
+                state.analysis_scroll + page,
+                max(0, len(state.analysis_rows) - (h - 8)))
+
+    elif key == curses.KEY_PPAGE:
+        page = max(1, h - 8)
+        state.analysis_scroll = max(0, state.analysis_scroll - page)
 
     elif key == ord('L'):
         path = read_line(win, h - 3, 2, "Load rp++ file: ")
@@ -1996,7 +2114,7 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
         state.files   = list(preloaded_files or [])
         files_str = ", ".join(os.path.basename(f) for f in state.files)
         state.status_msg = (f"Loaded {len(state.gadgets):,} gadgets from {files_str}  "
-                            f"|  ? help  |  1-4 tabs  |  q quit")
+                            f"|  ? help  |  1-6 tabs  |  q quit")
     if badchars is not None:
         state.badchars = badchars
         state.chain.badchars = badchars
@@ -2008,17 +2126,17 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
             draw_status_bar(stdscr, state)
 
             if state.active_tab == 0:
-                draw_search_tab(stdscr, state)
-            elif state.active_tab == 1:
-                draw_suggest_tab(stdscr, state)
-            elif state.active_tab == 2:
-                draw_chain_tab(stdscr, state)
-            elif state.active_tab == 3:
-                draw_nullcheck_tab(stdscr, state)
-            elif state.active_tab == 4:
-                draw_cheatsheet_tab(stdscr, state)
-            elif state.active_tab == 5:
                 draw_analysis_tab(stdscr, state)
+            elif state.active_tab == 1:
+                draw_search_tab(stdscr, state)
+            elif state.active_tab == 2:
+                draw_suggest_tab(stdscr, state)
+            elif state.active_tab == 3:
+                draw_chain_tab(stdscr, state)
+            elif state.active_tab == 4:
+                draw_nullcheck_tab(stdscr, state)
+            elif state.active_tab == 5:
+                draw_cheatsheet_tab(stdscr, state)
 
             stdscr.refresh()
             state.dirty = False
@@ -2030,6 +2148,10 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
 
         if key == -1:
             continue
+
+        if key in (curses.KEY_UP, curses.KEY_DOWN,
+                   curses.KEY_NPAGE, curses.KEY_PPAGE):
+            curses.flushinp()
 
         state.dirty = True
 
@@ -2155,38 +2277,38 @@ def tui_main(stdscr, preloaded_gadgets=None, preloaded_files=None, badchars=None
         elif key == ord('?'):
             draw_help(stdscr)
         elif key == ord('1'):
-            state.active_tab = 5
+            state.active_tab = 0
             state.scroll_offset = 0
         elif key == ord('2'):
-            state.active_tab = 0
+            state.active_tab = 1
             state.scroll_offset = 0
             state.selected_idx = 0
         elif key == ord('3'):
-            state.active_tab = 1
+            state.active_tab = 2
             state.scroll_offset = 0
         elif key == ord('4'):
-            state.active_tab = 2
+            state.active_tab = 3
             state.scroll_offset = 0
             state.selected_idx = 0
         elif key == ord('5'):
-            state.active_tab = 3
+            state.active_tab = 4
             state.scroll_offset = 0
         elif key == ord('6'):
-            state.active_tab = 4
+            state.active_tab = 5
             state.scroll_offset = 0
             state.cheat_scroll = 0
         elif state.active_tab == 0:
-            handle_search_key(stdscr, key, state)
-        elif state.active_tab == 1:
-            handle_suggest_key(stdscr, key, state)
-        elif state.active_tab == 2:
-            handle_chain_key(stdscr, key, state)
-        elif state.active_tab == 3:
-            handle_nullcheck_key(stdscr, key, state)
-        elif state.active_tab == 4:
-            handle_cheatsheet_key(stdscr, key, state)
-        elif state.active_tab == 5:
             handle_analysis_key(stdscr, key, state)
+        elif state.active_tab == 1:
+            handle_search_key(stdscr, key, state)
+        elif state.active_tab == 2:
+            handle_suggest_key(stdscr, key, state)
+        elif state.active_tab == 3:
+            handle_chain_key(stdscr, key, state)
+        elif state.active_tab == 4:
+            handle_nullcheck_key(stdscr, key, state)
+        elif state.active_tab == 5:
+            handle_cheatsheet_key(stdscr, key, state)
 
 
 def launch_tui(args=None):

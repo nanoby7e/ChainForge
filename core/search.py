@@ -102,6 +102,49 @@ class Gadget:
     def pack_line(self) -> str:
         return f'rop += pack("<L", ({self.addr_str}))  # {self.asm}'
 
+    def compact_side_effects(self) -> str:
+        """Compact stack cost summary: '+2 pops (esi, ebx) = 8B pad' style."""
+        instrs = [i.strip().lower() for i in self.instructions]
+        last = instrs[-1] if instrs else ""
+        parts = []
+
+        pop_regs = []
+        for ins in instrs[:-1]:
+            m = re.match(r'pop\s+(e[a-z]{2}|[a-z]{2})', ins)
+            if m:
+                pop_regs.append(m.group(1))
+        if re.match(r'pop\s+(e[a-z]{2})', last):
+            pop_regs.append(re.match(r'pop\s+(e[a-z]{2})', last).group(1))
+
+        retn_bytes = 0
+        m_retn = re.match(r'retn?\s+0x([0-9a-fA-F]+)', last)
+        if m_retn:
+            retn_bytes = int(m_retn.group(1), 16)
+
+        pad_bytes = len(pop_regs) * 4 + retn_bytes
+        if pop_regs:
+            parts.append(f"+{len(pop_regs)} pop ({', '.join(pop_regs)})")
+        if retn_bytes:
+            parts.append(f"retn 0x{retn_bytes:02x}")
+
+        has_memwrite = any(re.search(r'mov\s+.*\[', i) or re.search(r'add\s+byte\s*\[', i)
+                          for i in instrs)
+        has_call = any(re.search(r'call\s+', i) for i in instrs)
+        has_pivot = any(re.search(r'(xchg|mov|add|sub)\s+esp', i) for i in instrs)
+        if has_memwrite:
+            parts.append("writes mem")
+        if has_call:
+            parts.append("call")
+        if has_pivot:
+            parts.append("ESP pivot")
+
+        if not parts:
+            return ""
+        summary = " + ".join(parts)
+        if pad_bytes:
+            summary += f" = {pad_bytes}B pad"
+        return summary
+
 
 def parse_rpp_file(path: str) -> List[Gadget]:
     """Parse an rp++ output file into Gadget objects."""
@@ -182,13 +225,17 @@ def search_gadgets(
     """
     results = []
     compiled = None
+    neg_filters = []
     try:
         if regex_mode:
             compiled = re.compile(query, re.IGNORECASE)
             match_fn = lambda g: (bool(compiled.search(g.asm)) or
                                   bool(compiled.search(g.addr_str)))
         else:
-            q = query.lower().lstrip('0x')
+            tokens = query.split()
+            pos_tokens = [t for t in tokens if not t.startswith('-')]
+            neg_filters = [t[1:].lower() for t in tokens if t.startswith('-') and len(t) > 1]
+            q = ' '.join(pos_tokens).lower().lstrip('0x')
             match_fn = lambda g: (q in g.asm.lower() or
                                   q in g.addr_str.lower().lstrip('0x'))
     except re.error as e:
@@ -200,6 +247,10 @@ def search_gadgets(
             continue
         if not include_badchars and g.has_badchar(badchars):
             continue
+        if neg_filters:
+            asm_lower = g.asm.lower()
+            if any(nf in asm_lower for nf in neg_filters):
+                continue
         results.append(g)
 
     # Sort: plain ret first, then fewest instructions, then score

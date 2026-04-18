@@ -16,7 +16,7 @@ import re
 import sys
 import argparse
 from typing import List, Dict, Tuple, Optional
-from search import Gadget, search_gadgets, format_gadget, format_pack_line
+from core.search import Gadget, search_gadgets, format_gadget, format_pack_line
 
 # ── Register sets ──────────────────────────────────────────────────────────────
 
@@ -1329,7 +1329,7 @@ def cli_suggest(args: List[str]):
             print(f"    {pattern}\n")
         return
 
-    from search import parse_rpp_file
+    from core.search import parse_rpp_file
     try:
         badchars = bytes(int(x.strip(), 16) for x in ns.badchars.split(","))
     except ValueError:

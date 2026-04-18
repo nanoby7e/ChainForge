@@ -13,13 +13,6 @@ Usage:
 """
 
 import sys
-import os
-
-# Add subdirectories to sys.path so modules can import each other by bare name
-_here = os.path.dirname(os.path.abspath(__file__))
-for _sub in ('core', 'analysis', 'ui'):
-    sys.path.insert(0, os.path.join(_here, _sub))
-sys.path.insert(0, _here)
 
 def main():
     args = sys.argv[1:]

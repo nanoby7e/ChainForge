@@ -9,8 +9,8 @@ import argparse
 import json
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field, asdict
-from nullcheck import check_value, analyze_value, DEFAULT_BADCHARS
-from search import Gadget, parse_rpp_file, search_gadgets, format_gadget
+from core.nullcheck import check_value, analyze_value, DEFAULT_BADCHARS
+from core.search import Gadget, parse_rpp_file, search_gadgets, format_gadget
 
 
 @dataclass

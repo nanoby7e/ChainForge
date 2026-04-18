@@ -1,6 +1,29 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
+venv/
+.venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Gadget files (large rp++ output)
 *.txt
+
+# User data / session artifacts
 *.json
 *.log
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini

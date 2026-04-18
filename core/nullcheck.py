@@ -9,7 +9,7 @@ import argparse
 from typing import List, Tuple, Optional
 
 
-DEFAULT_BADCHARS = [0x00, 0x0A, 0x0D]
+DEFAULT_BADCHARS = bytes([0x00, 0x0A, 0x0D])
 
 # ── Core functions ─────────────────────────────────────────────────────────────
 

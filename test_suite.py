@@ -35,23 +35,9 @@ import traceback
 from datetime import datetime
 from typing import List, Tuple
 
-# ── Path setup ────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _sub in ('core', 'ui'):
-    sys.path.insert(0, os.path.join(_HERE, _sub))
-sys.path.insert(0, _HERE)
 
-# analysis.py lives in analysis/ as a module file — load it directly to avoid
-# the analysis/__init__.py package shadow
-import importlib.util as _ilu
-_aspec = _ilu.spec_from_file_location("_analysis",
-             os.path.join(_HERE, "analysis", "analysis.py"))
-_amod = _ilu.module_from_spec(_aspec)
-_aspec.loader.exec_module(_amod)
-# expose top-level helpers used across layers
-_run_analysis    = _amod.run_analysis
-_grade_asm_fn    = _amod._grade_asm
-_imm_badchar_fn  = _amod._imm_has_badchar
+from analysis.analysis import run_analysis as _run_analysis, _grade_asm as _grade_asm_fn, _imm_has_badchar as _imm_badchar_fn
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -140,7 +126,7 @@ def layer1_random_sample(log: Logger, counter: Counter,
     log.info(f'Bad chars: {[hex(b) for b in badchars]}')
     log.info(f'Total gadgets: {len(gadgets):,}  Clean: {len(clean):,}  Dirty: {len(dirty):,}')
 
-    from search import search_gadgets
+    from core.search import search_gadgets
 
     n = max(50, int(len(clean) * sample_pct / 100))
     sample = random.sample(clean, min(n, len(clean)))
@@ -250,7 +236,7 @@ def layer2_matrix_consistency(log: Logger, counter: Counter,
     log.info('Every non-zero matrix cell must match a direct search with the same pattern')
     log.write('')
 
-    from search import search_gadgets
+    from core.search import search_gadgets
     REGS = ['eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp']
 
     def count(pattern):
@@ -324,7 +310,7 @@ def layer2_matrix_consistency(log: Logger, counter: Counter,
 
     # ── 2b: Verify first search result per matrix cell is a clean address ────
     log.write('  Matrix best gadget address cleanliness (targeted per-cell)')
-    from search import search_gadgets as _sg2
+    from core.search import search_gadgets as _sg2
     MATS = [
         ('MOV',  lambda d, s: rf'mov\s+{d},\s*{s}.*ret'),
         ('PP',   lambda d, s: rf'push\s+{s}.*pop\s+{d}.*ret'),
@@ -354,7 +340,7 @@ def layer2_matrix_consistency(log: Logger, counter: Counter,
 
     # ── 2c: Count sanity — filtered <= unfiltered ─────────────────────────────
     log.write('  Count sanity (filtered <= unfiltered)')
-    from search import search_gadgets as sg
+    from core.search import search_gadgets as sg
     test_pats = [
         rf'mov\s+eax,\s*ecx.*ret',
         rf'push\s+eax.*pop\s+ebx.*ret',
@@ -527,8 +513,8 @@ def layer4_suggest_nullchk(log: Logger, counter: Counter,
     log.section('LAYER 4 — Suggest Tab & NullChk Validation')
     log.write('')
 
-    from suggest import resolve_goal, suggest_for_goal
-    from nullcheck import check_value
+    from core.suggest import resolve_goal, suggest_for_goal
+    from core.nullcheck import check_value
 
     # ── 4a: Suggest goals return clean results ────────────────────────────────
     log.write('  4a. Suggest goals — no dirty gadgets in results')
@@ -614,8 +600,8 @@ def layer5_chain(log: Logger, counter: Counter, gadgets, badchars):
     log.section('LAYER 5 — Chain Tab Validation')
     log.write('')
 
-    from chain import RopChain
-    from nullcheck import check_value
+    from core.chain import RopChain
+    from core.nullcheck import check_value
 
     chain = RopChain(badchars=badchars)
     chain.name = 'test_suite_chain'
@@ -728,7 +714,7 @@ def main():
         sys.exit(1)
 
     # ── Load gadget files ─────────────────────────────────────────────────────
-    from search import parse_rpp_file
+    from core.search import parse_rpp_file
 
     files = args.files
     if not files:

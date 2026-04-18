@@ -24,6 +24,14 @@ Everything is bad-char aware throughout. Gadgets at addresses containing bad byt
 
 ## Setup
 
+**Windows requirement:** Python on Windows does not include the `curses` module. Install it before first run:
+
+```bash
+pip install windows-curses
+```
+
+This is not needed on Linux or macOS where curses is part of the standard library.
+
 ```bash
 # Generate gadgets from a DLL using rp++
 rp-win-x86.exe -f target.dll -r 5 > target_rop.txt
@@ -99,13 +107,27 @@ Full DLL capability scan. Run this first on a new target to understand what is a
 
 Sections are produced in order:
 
+**Overview** — loaded files, total gadget count, bad chars, clean gadget count.
+
+**Gadget Quality Distribution** — score buckets and grade distribution with ASCII bar charts showing the cleanliness profile of your loaded gadgets.
+
+**Cross-Module Comparison** — per-module capability matrix across 10 operation categories. Appears when 2+ files are loaded, helping you identify which DLL is strongest for a given operation.
+
+**Module Address Analysis** — per-module address ranges, standard DLL/EXE range detection, null high byte flagging, and bad char impact breakdown per byte position.
+
+**API Chain Readiness** — 16-point prerequisite checklist for VirtualAlloc/WriteProcessMemory chains with an overall readiness verdict (EXCELLENT / GOOD / PARTIAL / LIMITED).
+
+**Gadget Reliability Summary** — distribution of reliability flags across your clean gadgets (plain ret, retn N, memory dereference, ESP modification, etc.).
+
+**Capture ESP** — per-register availability and best gadget for capturing the stack pointer.
+
+**Stack Pivot** — per-register and leave-based pivots with counts and best gadget.
+
 **EAX Hub Map** — maps every route to and from EAX across all loaded modules, with gadget counts and the best example for each direction. EAX is the primary relay register in most x86 ROP chains and this section gives you a quick picture of how reachable it is from any other register before you start planning.
 
-**Multiple-Hop Path Analysis** — for every register pair that has no direct copy route, ChainForge finds the best 2-hop relay through an intermediate register and grades the path. Grades are GOOD (all legs have clean gadgets with no destructive side effects), CAUTION (side effects present — `leave`, `retn N`, mid-gadget memory dereferences), or PROBLEMATIC (likely access violation — `hlt`, `rep movsd`, ESP corruption via dereference, segment register pops, privileged I/O). When the best gadget for a leg is flagged, an alternative is shown. Paths where no viable relay exists are explicitly listed so you know what is simply not available.
+**Multi-Hop Path Analysis** — for every register pair that has no direct copy route, ChainForge finds the best 2-hop relay through an intermediate register and grades the path. Grades are GOOD, CAUTION, or PROBLEMATIC. When the best gadget for a leg is flagged, an alternative is shown.
 
-**Memory Write Map** — for each pointer register, lists every source register that can be written to memory at that address, with grade and best gadget. Only GOOD and CAUTION gadgets are shown; PROBLEMATIC ones are excluded.
-
-**Memory Load Map** — the reverse: for each destination register, which pointer registers can load a value from memory into it.
+**Memory Write / Load Maps** — for each pointer register, lists which source registers can write to memory and which destination registers can load from memory, with grade and best gadget.
 
 **Register copy matrices** — `mov`, push/pop relay, and `xchg` counts for every register pair, with the best available gadget shown per row.
 
@@ -115,7 +137,7 @@ Sections are produced in order:
 
 **Inc / Dec / Neg** — per-register counts for single-register arithmetic.
 
-**Capture ESP, Zero Register, Stack Pivot, Key Single Instructions** — availability and best examples for each.
+**Zero Register, Key Single Instructions** — availability and best examples for each.
 
 ### [2] Search
 
@@ -127,6 +149,8 @@ Plain text and regex gadget search across all loaded files simultaneously. Resul
 - `c` — clear results and return to the intro screen
 - `Enter` — add selected gadget to chain
 - `a` — add all current results to chain
+
+Negative filters let you exclude terms with a `-` prefix (e.g. `mov eax -leave` finds `mov eax` gadgets that do not contain `leave`). Search history is available with UP/DN arrow keys in the input prompt. Selecting a gadget shows a compact side effect summary above the results list (e.g. `+2 pop (esi, ebx) = 8B pad`).
 
 You can search by address as well as ASM text — enter a full address like `0x10012f97` or a partial like `10012f` to find gadgets by location.
 
@@ -147,8 +171,10 @@ stack pivot           call virtualalloc
 
 - `/` — new goal
 - `n` — refine last goal
-- `c` — return to goal browser
+- `c` — return to goal catalogue
 - `Enter` — add selected gadget to chain
+
+The goal catalogue lists all available goals with descriptions, usage examples, and ASM examples. Selecting a gadget shows a side effect summary line, same as in Search.
 
 ### [4] Chain
 
@@ -207,6 +233,7 @@ The `--seed` flag makes sampling reproducible. The log file includes all PASS/FA
 chainforge/
 ├── chainforge.py          entry point
 ├── test_suite.py          validation test suite
+├── CHANGELOG.md           version history
 ├── gadgets/               drop rp++ .txt files here for auto-loading
 ├── core/
 │   ├── search.py          gadget search engine
